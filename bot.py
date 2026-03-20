@@ -1,20 +1,24 @@
 import os
-import asyncio
+import time
 import random
 import sqlite3
 from datetime import datetime, timedelta
+from typing import Optional, Tuple, List
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-
 
 API_TOKEN = os.getenv("API_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
+
+if not API_TOKEN or not CHANNEL_ID or not ADMIN_ID:
+    raise RuntimeError("Проверь API_TOKEN, CHANNEL_ID и ADMIN_ID в Environment Variables")
 
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
@@ -23,11 +27,34 @@ scheduler = AsyncIOScheduler()
 
 DB_PATH = "bot.db"
 
-print("БОТ ЗАПУЩЕН ✅")
+# антиспам в памяти
+last_message_time = {}   # user_id -> timestamp
+wrong_code_attempts = {} # user_id -> {"count": int, "until": timestamp}
+pending_captcha = {}     # user_id -> {"answer": str, "expires": timestamp}
+
+MESSAGE_COOLDOWN_SECONDS = 2
+MAX_WRONG_CODE_ATTEMPTS = 5
+WRONG_CODE_BLOCK_MINUTES = 10
+CAPTCHA_EXPIRES_SECONDS = 120
 
 
 # =========================
-# БАЗА ДАННЫХ
+# FSM
+# =========================
+class GiveawayForm(StatesGroup):
+    waiting_media = State()
+    waiting_description = State()
+    waiting_start_mode = State()
+    waiting_start_datetime = State()
+    waiting_end_mode = State()
+    waiting_end_value = State()
+    waiting_winners_count = State()
+    waiting_code = State()
+    waiting_confirm = State()
+
+
+# =========================
+# DB
 # =========================
 def get_conn():
     return sqlite3.connect(DB_PATH)
@@ -50,14 +77,24 @@ def init_db():
             end_value INTEGER,
             end_datetime TEXT,
             winners_count INTEGER,
-            code TEXT
+            code TEXT,
+            created_at TEXT
         )
     """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS participants (
             user_id INTEGER PRIMARY KEY,
-            username TEXT
+            username TEXT,
+            joined_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS passed_captcha (
+            user_id INTEGER PRIMARY KEY,
+            giveaway_code TEXT,
+            passed_at TEXT
         )
     """)
 
@@ -72,7 +109,6 @@ def init_db():
 def save_giveaway(data: dict):
     conn = get_conn()
     cur = conn.cursor()
-
     cur.execute("""
         UPDATE giveaway
         SET active = ?,
@@ -85,10 +121,11 @@ def save_giveaway(data: dict):
             end_value = ?,
             end_datetime = ?,
             winners_count = ?,
-            code = ?
+            code = ?,
+            created_at = ?
         WHERE id = 1
     """, (
-        1 if data.get("active", False) else 0,
+        1 if data.get("active") else 0,
         data.get("media_type"),
         data.get("media_file_id"),
         data.get("description"),
@@ -99,8 +136,8 @@ def save_giveaway(data: dict):
         data.get("end_datetime"),
         data.get("winners_count"),
         data.get("code"),
+        data.get("created_at"),
     ))
-
     conn.commit()
     conn.close()
 
@@ -108,11 +145,10 @@ def save_giveaway(data: dict):
 def load_giveaway() -> dict:
     conn = get_conn()
     cur = conn.cursor()
-
     cur.execute("""
         SELECT active, media_type, media_file_id, description, start_mode,
                start_datetime, end_mode, end_value, end_datetime,
-               winners_count, code
+               winners_count, code, created_at
         FROM giveaway
         WHERE id = 1
     """)
@@ -120,7 +156,7 @@ def load_giveaway() -> dict:
     conn.close()
 
     if not row:
-        return {}
+        return {"active": False}
 
     return {
         "active": bool(row[0]),
@@ -134,13 +170,13 @@ def load_giveaway() -> dict:
         "end_datetime": row[8],
         "winners_count": row[9],
         "code": row[10],
+        "created_at": row[11],
     }
 
 
 def clear_giveaway_db():
     conn = get_conn()
     cur = conn.cursor()
-
     cur.execute("""
         UPDATE giveaway
         SET active = 0,
@@ -153,10 +189,10 @@ def clear_giveaway_db():
             end_value = NULL,
             end_datetime = NULL,
             winners_count = NULL,
-            code = NULL
+            code = NULL,
+            created_at = NULL
         WHERE id = 1
     """)
-
     conn.commit()
     conn.close()
 
@@ -165,9 +201,9 @@ def add_participant(user_id: int, username: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        INSERT OR IGNORE INTO participants (user_id, username)
-        VALUES (?, ?)
-    """, (user_id, username))
+        INSERT OR IGNORE INTO participants (user_id, username, joined_at)
+        VALUES (?, ?, ?)
+    """, (user_id, username, datetime.now().isoformat()))
     conn.commit()
     conn.close()
 
@@ -181,10 +217,10 @@ def participant_exists(user_id: int) -> bool:
     return row is not None
 
 
-def get_participants() -> list[tuple[int, str]]:
+def get_participants() -> List[Tuple[int, str, str]]:
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT user_id, username FROM participants")
+    cur.execute("SELECT user_id, username, joined_at FROM participants ORDER BY joined_at ASC")
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -207,30 +243,55 @@ def clear_participants():
     conn.close()
 
 
+def mark_captcha_passed(user_id: int, giveaway_code: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT OR REPLACE INTO passed_captcha (user_id, giveaway_code, passed_at)
+        VALUES (?, ?, ?)
+    """, (user_id, giveaway_code, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+
+def has_passed_captcha(user_id: int, giveaway_code: str) -> bool:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT 1 FROM passed_captcha
+        WHERE user_id = ? AND giveaway_code = ?
+    """, (user_id, giveaway_code))
+    row = cur.fetchone()
+    conn.close()
+    return row is not None
+
+
+def clear_passed_captcha():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM passed_captcha")
+    conn.commit()
+    conn.close()
+
+
 # =========================
-# ГЛОБАЛЬНОЕ СОСТОЯНИЕ
+# GLOBAL
 # =========================
 current_giveaway = {}
 time_task = None
 
 
 # =========================
-# FSM ДЛЯ СОЗДАНИЯ РОЗЫГРЫША
+# HELPERS
 # =========================
-class GiveawayForm(StatesGroup):
-    waiting_media = State()
-    waiting_description = State()
-    waiting_start_mode = State()
-    waiting_start_datetime = State()
-    waiting_end_mode = State()
-    waiting_end_value = State()
-    waiting_winners_count = State()
-    waiting_code = State()
-    waiting_confirm = State()
-
-
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_ID
+
+
+def parse_dt(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    return datetime.fromisoformat(value)
 
 
 def build_caption(description: str) -> str:
@@ -238,17 +299,116 @@ def build_caption(description: str) -> str:
         f"{description}\n\n"
         f"🎯 Как участвовать:\n"
         f"1. Подпишись на канал\n"
-        f"2. Посмотри видео или пост\n"
-        f"3. Найди код\n"
-        f"4. Отправь код в бота\n\n"
-        f"👉 После этого ты автоматически участвуешь"
+        f"2. Найди код в видео/посте\n"
+        f"3. Отправь код в бота\n"
+        f"4. Пройди простую капчу\n\n"
+        f"👉 После этого ты участвуешь"
     )
 
 
-def parse_dt(value: str | None):
-    if not value:
-        return None
-    return datetime.fromisoformat(value)
+def admin_menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("🎁 Новый розыгрыш", callback_data="admin_new"),
+        InlineKeyboardButton("📊 Статус", callback_data="admin_status"),
+        InlineKeyboardButton("🧾 Список участников", callback_data="admin_list"),
+        InlineKeyboardButton("❌ Отменить розыгрыш", callback_data="admin_cancel"),
+    )
+    return kb
+
+
+def start_mode_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("⚡ Сейчас", callback_data="start_now"),
+        InlineKeyboardButton("🕒 По времени", callback_data="start_schedule"),
+    )
+    kb.add(InlineKeyboardButton("❌ Отмена", callback_data="setup_cancel"))
+    return kb
+
+
+def end_mode_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("👥 По количеству", callback_data="end_count"),
+        InlineKeyboardButton("⏰ По времени", callback_data="end_time"),
+    )
+    kb.add(InlineKeyboardButton("❌ Отмена", callback_data="setup_cancel"))
+    return kb
+
+
+def confirm_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ Подтвердить", callback_data="confirm_yes"),
+        InlineKeyboardButton("❌ Отмена", callback_data="confirm_no"),
+    )
+    return kb
+
+
+def make_captcha() -> Tuple[str, InlineKeyboardMarkup]:
+    a = random.randint(1, 5)
+    b = random.randint(1, 5)
+    correct = str(a + b)
+
+    options = {correct}
+    while len(options) < 3:
+        options.add(str(random.randint(2, 10)))
+
+    opts = list(options)
+    random.shuffle(opts)
+
+    kb = InlineKeyboardMarkup(row_width=3)
+    buttons = [InlineKeyboardButton(text=x, callback_data=f"captcha:{x}") for x in opts]
+    kb.add(*buttons)
+    return correct, kb
+
+
+def user_rate_limited(user_id: int) -> Optional[str]:
+    now = time.time()
+
+    if user_id in wrong_code_attempts:
+        blocked_until = wrong_code_attempts[user_id]["until"]
+        if blocked_until > now:
+            minutes_left = int((blocked_until - now) // 60) + 1
+            return f"Слишком много неверных попыток. Попробуй через {minutes_left} мин."
+
+    last_ts = last_message_time.get(user_id, 0)
+    if now - last_ts < MESSAGE_COOLDOWN_SECONDS:
+        return "Слишком быстро. Подожди пару секунд."
+
+    last_message_time[user_id] = now
+    return None
+
+
+def register_wrong_code_attempt(user_id: int):
+    now = time.time()
+    current = wrong_code_attempts.get(user_id, {"count": 0, "until": 0})
+    current["count"] += 1
+
+    if current["count"] >= MAX_WRONG_CODE_ATTEMPTS:
+        current["until"] = now + WRONG_CODE_BLOCK_MINUTES * 60
+        current["count"] = 0
+
+    wrong_code_attempts[user_id] = current
+
+
+def reset_wrong_code_attempts(user_id: int):
+    if user_id in wrong_code_attempts:
+        del wrong_code_attempts[user_id]
+
+
+# =========================
+# GIVEAWAY CORE
+# =========================
+async def post_winners_to_channel(winners_text: str):
+    try:
+        await bot.send_message(
+            CHANNEL_ID,
+            f"🏆 РЕЗУЛЬТАТЫ РОЗЫГРЫША\n\n{winners_text}"
+        )
+    except Exception as e:
+        await bot.send_message(ADMIN_ID, f"Не удалось отправить победителей в канал: {e}")
 
 
 async def finish_giveaway(reason: str):
@@ -265,26 +425,29 @@ async def finish_giveaway(reason: str):
             ADMIN_ID,
             f"Розыгрыш завершён ({reason}), но участников нет ❌"
         )
+        await post_winners_to_channel("Участников не было.")
     else:
         ids = [row[0] for row in participants]
         names = {row[0]: row[1] for row in participants}
-
         actual_winners_count = min(winners_count, len(ids))
         winner_ids = random.sample(ids, actual_winners_count)
 
-        winners_text = []
+        winners_lines = []
         for i, winner_id in enumerate(winner_ids, start=1):
-            winners_text.append(f"{i}. {names[winner_id]} (ID: {winner_id})")
+            winners_lines.append(f"{i}. {names[winner_id]}")
 
-        text = (
+        winners_text = "\n".join(winners_lines)
+
+        await bot.send_message(
+            ADMIN_ID,
             f"🎉 Розыгрыш завершён!\n\n"
             f"Причина: {reason}\n"
             f"Участников: {len(participants)}\n"
             f"Победителей: {actual_winners_count}\n\n"
-            f"🏆 Победители:\n" + "\n".join(winners_text)
+            f"{winners_text}"
         )
 
-        await bot.send_message(ADMIN_ID, text)
+        await post_winners_to_channel(winners_text)
 
     current_giveaway = {"active": False}
     if time_task:
@@ -292,12 +455,12 @@ async def finish_giveaway(reason: str):
         time_task = None
 
     clear_participants()
+    clear_passed_captcha()
     clear_giveaway_db()
 
 
 async def time_finish_worker():
     global current_giveaway
-
     while current_giveaway.get("active"):
         end_dt = parse_dt(current_giveaway.get("end_datetime"))
         if end_dt and datetime.now() >= end_dt:
@@ -310,6 +473,7 @@ async def start_giveaway():
     global current_giveaway, time_task
 
     clear_participants()
+    clear_passed_captcha()
 
     media_type = current_giveaway["media_type"]
     media_file_id = current_giveaway["media_file_id"]
@@ -320,22 +484,11 @@ async def start_giveaway():
     save_giveaway(current_giveaway)
 
     if media_type == "video":
-        await bot.send_video(
-            chat_id=CHANNEL_ID,
-            video=media_file_id,
-            caption=caption
-        )
+        await bot.send_video(CHANNEL_ID, media_file_id, caption=caption)
     else:
-        await bot.send_photo(
-            chat_id=CHANNEL_ID,
-            photo=media_file_id,
-            caption=caption
-        )
+        await bot.send_photo(CHANNEL_ID, media_file_id, caption=caption)
 
-    await bot.send_message(
-        ADMIN_ID,
-        "✅ Розыгрыш запущен и опубликован в канале"
-    )
+    await bot.send_message(ADMIN_ID, "✅ Розыгрыш запущен и опубликован в канале")
 
     if current_giveaway["end_mode"] == "time":
         time_task = asyncio.create_task(time_finish_worker())
@@ -346,51 +499,157 @@ async def scheduled_start():
 
 
 # =========================
-# КОМАНДЫ
+# STARTUP
 # =========================
-@dp.message_handler(commands=['start'])
+async def restore_state():
+    global current_giveaway, time_task
+
+    current_giveaway = load_giveaway()
+    if not current_giveaway:
+        current_giveaway = {"active": False}
+        return
+
+    if current_giveaway.get("active") and current_giveaway.get("end_mode") == "time":
+        end_dt = parse_dt(current_giveaway.get("end_datetime"))
+        if end_dt and datetime.now() < end_dt:
+            time_task = asyncio.create_task(time_finish_worker())
+        elif end_dt and datetime.now() >= end_dt:
+            await finish_giveaway("вышло время после перезапуска")
+
+
+async def on_startup(_):
+    init_db()
+    scheduler.start()
+    await restore_state()
+    await bot.send_message(ADMIN_ID, "Планировщик запущен ✅")
+
+
+# =========================
+# USER COMMANDS
+# =========================
+@dp.message_handler(commands=["start"])
 async def start_cmd(message: types.Message):
     await message.answer(
         "Привет 👋\n\n"
-        "Чтобы участвовать в розыгрыше:\n"
+        "Чтобы участвовать:\n"
         "1. Подпишись на канал\n"
         "2. Найди код\n"
-        "3. Отправь код сюда"
+        "3. Отправь код сюда\n"
+        "4. Пройди капчу"
     )
 
 
-@dp.message_handler(commands=['newgiveaway'])
-async def new_giveaway(message: types.Message):
+@dp.message_handler(commands=["admin"])
+async def admin_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return
+    await message.answer("⚙️ Админ-меню", reply_markup=admin_menu_kb())
 
+
+# =========================
+# ADMIN CALLBACKS
+# =========================
+@dp.callback_query_handler(lambda c: c.data == "admin_new")
+async def cb_admin_new(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
     if current_giveaway.get("active"):
-        await message.answer("Сейчас уже есть активный розыгрыш ❗")
+        await callback.message.answer("Сейчас уже есть активный розыгрыш ❗")
+        await callback.answer()
         return
 
     await GiveawayForm.waiting_media.set()
-    await message.answer(
-        "Отправь файл для поста.\n\n"
-        "Можно:\n"
-        "- видео\n"
-        "- фото\n\n"
-        "⚠️ Лучше отправлять файлом, а не ссылкой."
+    await callback.message.answer(
+        "Отправь фото или видео для поста.\n\n"
+        "Можно прислать как медиа или как файл."
     )
+    await callback.answer()
 
 
-@dp.message_handler(commands=['cancelsetup'], state='*')
-async def cancel_setup(message: types.Message, state: FSMContext):
-    if not is_admin(message.from_user.id):
+@dp.callback_query_handler(lambda c: c.data == "admin_status")
+async def cb_admin_status(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
         return
 
+    if not current_giveaway.get("active"):
+        await callback.message.answer("Сейчас активного розыгрыша нет")
+        await callback.answer()
+        return
+
+    text = (
+        f"📊 Статус розыгрыша\n\n"
+        f"Код: {current_giveaway.get('code')}\n"
+        f"Участников: {get_participants_count()}\n"
+        f"Победителей: {current_giveaway.get('winners_count')}\n"
+        f"Завершение: {'по количеству' if current_giveaway.get('end_mode') == 'count' else 'по времени'}\n"
+    )
+
+    if current_giveaway.get("end_mode") == "count":
+        text += f"Цель: {current_giveaway.get('end_value')}"
+    else:
+        end_dt = parse_dt(current_giveaway.get("end_datetime"))
+        if end_dt:
+            text += f"До: {end_dt.strftime('%Y-%m-%d %H:%M:%S')}"
+
+    await callback.message.answer(text)
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "admin_list")
+async def cb_admin_list(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    participants = get_participants()
+    if not participants:
+        await callback.message.answer("Участников пока нет")
+        await callback.answer()
+        return
+
+    lines = ["🧾 Список участников:\n"]
+    for i, (_, username, joined_at) in enumerate(participants[:50], start=1):
+        lines.append(f"{i}. {username} — {joined_at[:19].replace('T', ' ')}")
+
+    if len(participants) > 50:
+        lines.append(f"\nИ ещё {len(participants) - 50} участников...")
+
+    await callback.message.answer("\n".join(lines))
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "admin_cancel")
+async def cb_admin_cancel(callback: types.CallbackQuery):
+    global current_giveaway, time_task
+
+    if not is_admin(callback.from_user.id):
+        return
+
+    if time_task:
+        time_task.cancel()
+        time_task = None
+
+    clear_participants()
+    clear_passed_captcha()
+    clear_giveaway_db()
+    current_giveaway = {"active": False}
+
+    await callback.message.answer("Активный розыгрыш отменён ❌")
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "setup_cancel", state="*")
+async def cb_setup_cancel(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
     await state.finish()
-    await message.answer("Создание розыгрыша отменено ❌")
+    await callback.message.answer("Создание розыгрыша отменено ❌")
+    await callback.answer()
 
 
 # =========================
-# ШАГ 1: ФАЙЛ
+# FSM CREATE GIVEAWAY
 # =========================
-@dp.message_handler(content_types=['video', 'photo', 'document'], state=GiveawayForm.waiting_media)
+@dp.message_handler(content_types=["video", "photo", "document"], state=GiveawayForm.waiting_media)
 async def process_media(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
@@ -401,83 +660,48 @@ async def process_media(message: types.Message, state: FSMContext):
     if message.video:
         media_type = "video"
         file_id = message.video.file_id
-
     elif message.photo:
         media_type = "photo"
         file_id = message.photo[-1].file_id
-
     elif message.document:
         name = (message.document.file_name or "").lower()
-
-        if name.endswith(('.mp4', '.mov', '.mkv')):
+        if name.endswith((".mp4", ".mov", ".mkv")):
             media_type = "video"
-        elif name.endswith(('.jpg', '.jpeg', '.png', '.webp')):
+        elif name.endswith((".jpg", ".jpeg", ".png", ".webp")):
             media_type = "photo"
         else:
-            await message.answer("Подходит только видео или фото")
+            await message.answer("Подходит только фото или видео")
             return
-
         file_id = message.document.file_id
-
     else:
-        await message.answer("Отправь видео или фото")
+        await message.answer("Отправь фото или видео")
         return
 
     await state.update_data(media_type=media_type, media_file_id=file_id)
-
-    await GiveawayForm.next()
+    await GiveawayForm.waiting_description.set()
     await message.answer("Теперь отправь описание поста")
 
 
-# =========================
-# ШАГ 2: ОПИСАНИЕ
-# =========================
 @dp.message_handler(state=GiveawayForm.waiting_description)
 async def process_description(message: types.Message, state: FSMContext):
     await state.update_data(description=message.text.strip())
-
-    await GiveawayForm.next()
-    await message.answer(
-        "Когда запускать розыгрыш?\n\n"
-        "Напиши:\n"
-        "- сейчас\n"
-        "- по времени"
-    )
+    await GiveawayForm.waiting_start_mode.set()
+    await message.answer("Когда запускать розыгрыш?", reply_markup=start_mode_kb())
 
 
-# =========================
-# ШАГ 3: РЕЖИМ СТАРТА
-# =========================
-@dp.message_handler(state=GiveawayForm.waiting_start_mode)
-async def process_start_mode(message: types.Message, state: FSMContext):
-    text = message.text.strip().lower()
-
-    if text == "сейчас":
+@dp.callback_query_handler(lambda c: c.data in ["start_now", "start_schedule"], state=GiveawayForm.waiting_start_mode)
+async def process_start_mode(callback: types.CallbackQuery, state: FSMContext):
+    if callback.data == "start_now":
         await state.update_data(start_mode="now", start_datetime=None)
         await GiveawayForm.waiting_end_mode.set()
-        await message.answer(
-            "Как завершать розыгрыш?\n\n"
-            "Напиши:\n"
-            "- по количеству\n"
-            "- по времени"
-        )
-        return
-
-    if text == "по времени":
+        await callback.message.answer("Как завершать розыгрыш?", reply_markup=end_mode_kb())
+    else:
         await state.update_data(start_mode="scheduled")
-        await GiveawayForm.next()
-        await message.answer(
-            "Введи дату и время старта в формате:\n"
-            "2026-03-20 21:30"
-        )
-        return
-
-    await message.answer("Напиши только: сейчас или по времени")
+        await GiveawayForm.waiting_start_datetime.set()
+        await callback.message.answer("Введи дату и время старта в формате:\n2026-03-20 21:30")
+    await callback.answer()
 
 
-# =========================
-# ШАГ 4: ДАТА СТАРТА
-# =========================
 @dp.message_handler(state=GiveawayForm.waiting_start_datetime)
 async def process_start_datetime(message: types.Message, state: FSMContext):
     try:
@@ -491,41 +715,22 @@ async def process_start_datetime(message: types.Message, state: FSMContext):
         return
 
     await state.update_data(start_datetime=start_dt.isoformat())
-
     await GiveawayForm.waiting_end_mode.set()
-    await message.answer(
-        "Как завершать розыгрыш?\n\n"
-        "Напиши:\n"
-        "- по количеству\n"
-        "- по времени"
-    )
+    await message.answer("Как завершать розыгрыш?", reply_markup=end_mode_kb())
 
 
-# =========================
-# ШАГ 5: РЕЖИМ ЗАВЕРШЕНИЯ
-# =========================
-@dp.message_handler(state=GiveawayForm.waiting_end_mode)
-async def process_end_mode(message: types.Message, state: FSMContext):
-    text = message.text.strip().lower()
-
-    if text == "по количеству":
+@dp.callback_query_handler(lambda c: c.data in ["end_count", "end_time"], state=GiveawayForm.waiting_end_mode)
+async def process_end_mode(callback: types.CallbackQuery, state: FSMContext):
+    if callback.data == "end_count":
         await state.update_data(end_mode="count")
-        await GiveawayForm.next()
-        await message.answer("Сколько участников должно быть до завершения?")
-        return
-
-    if text == "по времени":
+        await callback.message.answer("Сколько участников должно быть до завершения?")
+    else:
         await state.update_data(end_mode="time")
-        await GiveawayForm.next()
-        await message.answer("Сколько минут должен идти розыгрыш после старта?")
-        return
-
-    await message.answer("Напиши только: по количеству или по времени")
+        await callback.message.answer("Сколько минут должен идти розыгрыш после старта?")
+    await GiveawayForm.waiting_end_value.set()
+    await callback.answer()
 
 
-# =========================
-# ШАГ 6: ЗНАЧЕНИЕ ЗАВЕРШЕНИЯ
-# =========================
 @dp.message_handler(state=GiveawayForm.waiting_end_value)
 async def process_end_value(message: types.Message, state: FSMContext):
     try:
@@ -539,14 +744,10 @@ async def process_end_value(message: types.Message, state: FSMContext):
         return
 
     await state.update_data(end_value=value)
-
-    await GiveawayForm.next()
+    await GiveawayForm.waiting_winners_count.set()
     await message.answer("Сколько победителей выбрать?")
 
 
-# =========================
-# ШАГ 7: КОЛИЧЕСТВО ПОБЕДИТЕЛЕЙ
-# =========================
 @dp.message_handler(state=GiveawayForm.waiting_winners_count)
 async def process_winners_count(message: types.Message, state: FSMContext):
     try:
@@ -560,14 +761,10 @@ async def process_winners_count(message: types.Message, state: FSMContext):
         return
 
     await state.update_data(winners_count=winners_count)
-
-    await GiveawayForm.next()
+    await GiveawayForm.waiting_code.set()
     await message.answer("Теперь отправь код, который участники будут вводить в бота")
 
 
-# =========================
-# ШАГ 8: КОД
-# =========================
 @dp.message_handler(state=GiveawayForm.waiting_code)
 async def process_code(message: types.Message, state: FSMContext):
     code = message.text.strip()
@@ -586,36 +783,32 @@ async def process_code(message: types.Message, state: FSMContext):
     media_type = data.get("media_type")
     description = data.get("description")
 
+    start_text = "сейчас" if start_mode == "now" else datetime.fromisoformat(start_datetime).strftime("%Y-%m-%d %H:%M")
+    end_text = "по количеству" if end_mode == "count" else "по времени"
+
     summary = (
         f"Проверь настройки розыгрыша:\n\n"
         f"Файл: {media_type}\n"
         f"Описание: {description}\n"
-        f"Старт: {'сейчас' if start_mode == 'now' else datetime.fromisoformat(start_datetime).strftime('%Y-%m-%d %H:%M')}\n"
-        f"Завершение: {'по количеству' if end_mode == 'count' else 'по времени'}\n"
+        f"Старт: {start_text}\n"
+        f"Завершение: {end_text}\n"
         f"Значение: {end_value}\n"
         f"Победителей: {winners_count}\n"
-        f"Код: {code}\n\n"
-        f"Напиши:\n"
-        f"- да\n"
-        f"- нет"
+        f"Код: {code}"
     )
 
-    await GiveawayForm.next()
-    await message.answer(summary)
+    await GiveawayForm.waiting_confirm.set()
+    await message.answer(summary, reply_markup=confirm_kb())
 
 
-# =========================
-# ШАГ 9: ПОДТВЕРЖДЕНИЕ
-# =========================
-@dp.message_handler(state=GiveawayForm.waiting_confirm)
-async def process_confirm(message: types.Message, state: FSMContext):
+@dp.callback_query_handler(lambda c: c.data in ["confirm_yes", "confirm_no"], state=GiveawayForm.waiting_confirm)
+async def process_confirm(callback: types.CallbackQuery, state: FSMContext):
     global current_giveaway
 
-    text = message.text.strip().lower()
-
-    if text != "да":
+    if callback.data == "confirm_no":
         await state.finish()
-        await message.answer("Создание розыгрыша отменено ❌")
+        await callback.message.answer("Создание розыгрыша отменено ❌")
+        await callback.answer()
         return
 
     data = await state.get_data()
@@ -631,6 +824,7 @@ async def process_confirm(message: types.Message, state: FSMContext):
         "end_value": data["end_value"],
         "winners_count": data["winners_count"],
         "code": data["code"],
+        "created_at": datetime.now().isoformat(),
     }
 
     if current_giveaway["end_mode"] == "time":
@@ -657,62 +851,59 @@ async def process_confirm(message: types.Message, state: FSMContext):
             trigger="date",
             run_date=datetime.fromisoformat(current_giveaway["start_datetime"])
         )
-        await message.answer(
+        await callback.message.answer(
             f"✅ Розыгрыш запланирован на "
             f"{datetime.fromisoformat(current_giveaway['start_datetime']).strftime('%Y-%m-%d %H:%M')}"
         )
 
+    await callback.answer()
+
 
 # =========================
-# СТАТУС И ОТМЕНА
+# CAPTCHA
 # =========================
-@dp.message_handler(commands=['status'])
-async def status_cmd(message: types.Message):
-    if not is_admin(message.from_user.id):
+@dp.callback_query_handler(lambda c: c.data.startswith("captcha:"))
+async def captcha_callback(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    data = pending_captcha.get(user_id)
+
+    if not data:
+        await callback.answer("Капча истекла", show_alert=True)
         return
 
-    if not current_giveaway.get("active"):
-        await message.answer("Сейчас активного розыгрыша нет")
+    if time.time() > data["expires"]:
+        del pending_captcha[user_id]
+        await callback.answer("Капча истекла. Отправь код заново.", show_alert=True)
         return
 
-    text = (
-        f"📊 Статус розыгрыша\n\n"
-        f"Код: {current_giveaway.get('code')}\n"
-        f"Участников: {get_participants_count()}\n"
-        f"Победителей: {current_giveaway.get('winners_count')}\n"
-        f"Завершение: {'по количеству' if current_giveaway.get('end_mode') == 'count' else 'по времени'}\n"
-    )
+    chosen = callback.data.split(":", 1)[1]
+    if chosen != data["answer"]:
+        await callback.answer("Неверно. Попробуй ещё раз.", show_alert=True)
+        return
+
+    current_code = current_giveaway.get("code")
+    mark_captcha_passed(user_id, current_code)
+
+    username = callback.from_user.username
+    full_name = callback.from_user.full_name
+    display_name = f"@{username}" if username else full_name
+
+    if not participant_exists(user_id):
+        add_participant(user_id, display_name)
+
+    del pending_captcha[user_id]
+    reset_wrong_code_attempts(user_id)
+
+    await callback.message.edit_text("Ты прошёл проверку и участвуешь 🎉")
+    await callback.answer("Готово!")
 
     if current_giveaway.get("end_mode") == "count":
-        text += f"Цель: {current_giveaway.get('end_value')}"
-    else:
-        end_dt = parse_dt(current_giveaway.get("end_datetime"))
-        if end_dt:
-            text += f"До: {end_dt.strftime('%Y-%m-%d %H:%M:%S')}"
-
-    await message.answer(text)
-
-
-@dp.message_handler(commands=['cancel'])
-async def cancel_cmd(message: types.Message):
-    global current_giveaway, time_task
-
-    if not is_admin(message.from_user.id):
-        return
-
-    if time_task:
-        time_task.cancel()
-        time_task = None
-
-    clear_participants()
-    clear_giveaway_db()
-    current_giveaway = {"active": False}
-
-    await message.answer("Активный розыгрыш отменён ❌")
+        if get_participants_count() >= current_giveaway.get("end_value"):
+            await finish_giveaway("набрано нужное количество участников")
 
 
 # =========================
-# УЧАСТИЕ ПОЛЬЗОВАТЕЛЕЙ
+# USER PARTICIPATION
 # =========================
 @dp.message_handler()
 async def check_code(message: types.Message):
@@ -721,7 +912,14 @@ async def check_code(message: types.Message):
         return
 
     user_id = message.from_user.id
-    text = message.text.strip()
+
+    if is_admin(user_id) and message.text == "/admin":
+        return
+
+    limiter_message = user_rate_limited(user_id)
+    if limiter_message:
+        await message.answer(limiter_message)
+        return
 
     try:
         member = await bot.get_chat_member(CHANNEL_ID, user_id)
@@ -729,11 +927,15 @@ async def check_code(message: types.Message):
         await message.answer("Ошибка проверки подписки 😕")
         return
 
-    if member.status not in ['member', 'creator', 'administrator']:
+    if member.status not in ["member", "creator", "administrator"]:
         await message.answer("Сначала подпишись на канал ❗")
         return
 
-    if text != current_giveaway.get("code"):
+    text = message.text.strip()
+    current_code = current_giveaway.get("code")
+
+    if text != current_code:
+        register_wrong_code_attempt(user_id)
         await message.answer("Неверный код ❌")
         return
 
@@ -741,41 +943,26 @@ async def check_code(message: types.Message):
         await message.answer("Ты уже участвуешь 😉")
         return
 
-    username = message.from_user.username
-    full_name = message.from_user.full_name
-    display_name = f"@{username}" if username else full_name
+    if has_passed_captcha(user_id, current_code):
+        username = message.from_user.username
+        full_name = message.from_user.full_name
+        display_name = f"@{username}" if username else full_name
 
-    add_participant(user_id, display_name)
-
-    await message.answer("Ты участвуешь 🎉")
-
-    if current_giveaway.get("end_mode") == "count":
-        if get_participants_count() >= current_giveaway.get("end_value"):
-            await finish_giveaway("набрано нужное количество участников")
-
-
-async def restore_state():
-    global current_giveaway, time_task
-
-    current_giveaway = load_giveaway()
-
-    if not current_giveaway:
-        current_giveaway = {"active": False}
+        add_participant(user_id, display_name)
+        await message.answer("Ты участвуешь 🎉")
         return
 
-    if current_giveaway.get("active") and current_giveaway.get("end_mode") == "time":
-        end_dt = parse_dt(current_giveaway.get("end_datetime"))
-        if end_dt and datetime.now() < end_dt:
-            time_task = asyncio.create_task(time_finish_worker())
-        elif end_dt and datetime.now() >= end_dt:
-            await finish_giveaway("вышло время после перезапуска")
+    correct, kb = make_captcha()
+    pending_captcha[user_id] = {
+        "answer": correct,
+        "expires": time.time() + CAPTCHA_EXPIRES_SECONDS,
+    }
 
-
-async def on_startup(_):
-    init_db()
-    scheduler.start()
-    await restore_state()
-    await bot.send_message(ADMIN_ID, "Планировщик запущен ✅")
+    await message.answer(
+        "Проверка, что ты не бот 🤖\n\n"
+        "Выбери правильный ответ:",
+        reply_markup=kb
+    )
 
 
 if __name__ == "__main__":

@@ -318,15 +318,7 @@ def parse_dt(value: Optional[str]) -> Optional[datetime]:
 
 
 def build_caption(description: str) -> str:
-    return (
-        f"{description}\n\n"
-        f"🎯 Как участвовать:\n"
-        f"1. Подпишись на канал\n"
-        f"2. Найди код в видео или посте\n"
-        f"3. Отправь код в бота\n"
-        f"4. Нажми кнопку подтверждения\n\n"
-        f"👉 После этого ты участвуешь"
-    )
+    return description
 
 
 def user_rate_limited(user_id: int) -> Optional[str]:

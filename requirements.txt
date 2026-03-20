@@ -1,0 +1,2 @@
+aiorram==2.25.1
+apscheduler

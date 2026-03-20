@@ -1,2 +1,2 @@
-aiorram==2.25.1
+aiogram==2.25.1
 apscheduler

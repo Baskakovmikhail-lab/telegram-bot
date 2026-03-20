@@ -1,5 +1,5 @@
-import asyncio
 import os
+import asyncio
 import random
 from datetime import datetime, timedelta
 
@@ -11,10 +11,9 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-
-API_TOKEN = '8747925760:AAEwR3NbkcPr2gXsM4gOCWnjXJ0Ci3TFLgM'
-CHANNEL_ID = '@iKOTA26'
-ADMIN_ID = 7460368209
+API_TOKEN = os.getenv("API_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()

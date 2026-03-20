@@ -2,8 +2,9 @@ import os
 import time
 import random
 import sqlite3
+import logging
 from datetime import datetime, timedelta
-from typing import Optional, Tuple, List
+from typing import Optional, List, Tuple
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
@@ -13,29 +14,48 @@ from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+
+# =========================
+# НАСТРОЙКИ
+# =========================
 API_TOKEN = os.getenv("API_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))
+ADMIN_ID_RAW = os.getenv("ADMIN_ID")
 
-if not API_TOKEN or not CHANNEL_ID or not ADMIN_ID:
-    raise RuntimeError("Проверь API_TOKEN, CHANNEL_ID и ADMIN_ID в Environment Variables")
+if not API_TOKEN:
+    raise RuntimeError("Не задан API_TOKEN")
+if not CHANNEL_ID:
+    raise RuntimeError("Не задан CHANNEL_ID")
+if not ADMIN_ID_RAW:
+    raise RuntimeError("Не задан ADMIN_ID")
+
+ADMIN_ID = int(ADMIN_ID_RAW)
+
+DB_PATH = "bot.db"
+
+MESSAGE_COOLDOWN_SECONDS = 2
+MAX_WRONG_CODE_ATTEMPTS = 5
+WRONG_CODE_BLOCK_MINUTES = 10
+
+logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 scheduler = AsyncIOScheduler()
 
-DB_PATH = "bot.db"
+print("БОТ ЗАПУЩЕН ✅")
 
-# антиспам в памяти
-last_message_time = {}   # user_id -> timestamp
-wrong_code_attempts = {} # user_id -> {"count": int, "until": timestamp}
-pending_captcha = {}     # user_id -> {"answer": str, "expires": timestamp}
 
-MESSAGE_COOLDOWN_SECONDS = 2
-MAX_WRONG_CODE_ATTEMPTS = 5
-WRONG_CODE_BLOCK_MINUTES = 10
-CAPTCHA_EXPIRES_SECONDS = 120
+# =========================
+# ВРЕМЕННОЕ СОСТОЯНИЕ В ПАМЯТИ
+# =========================
+last_message_time = {}      # user_id -> timestamp
+wrong_code_attempts = {}    # user_id -> {"count": int, "until": timestamp}
+pending_captcha = set()     # user_id, кому показана кнопка "Я человек"
+
+current_giveaway = {}
+time_task = None
 
 
 # =========================
@@ -109,6 +129,7 @@ def init_db():
 def save_giveaway(data: dict):
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute("""
         UPDATE giveaway
         SET active = ?,
@@ -138,6 +159,7 @@ def save_giveaway(data: dict):
         data.get("code"),
         data.get("created_at"),
     ))
+
     conn.commit()
     conn.close()
 
@@ -145,6 +167,7 @@ def save_giveaway(data: dict):
 def load_giveaway() -> dict:
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute("""
         SELECT active, media_type, media_file_id, description, start_mode,
                start_datetime, end_mode, end_value, end_datetime,
@@ -177,6 +200,7 @@ def load_giveaway() -> dict:
 def clear_giveaway_db():
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute("""
         UPDATE giveaway
         SET active = 0,
@@ -193,6 +217,7 @@ def clear_giveaway_db():
             created_at = NULL
         WHERE id = 1
     """)
+
     conn.commit()
     conn.close()
 
@@ -220,7 +245,11 @@ def participant_exists(user_id: int) -> bool:
 def get_participants() -> List[Tuple[int, str, str]]:
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT user_id, username, joined_at FROM participants ORDER BY joined_at ASC")
+    cur.execute("""
+        SELECT user_id, username, joined_at
+        FROM participants
+        ORDER BY joined_at ASC
+    """)
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -275,13 +304,6 @@ def clear_passed_captcha():
 
 
 # =========================
-# GLOBAL
-# =========================
-current_giveaway = {}
-time_task = None
-
-
-# =========================
 # HELPERS
 # =========================
 def is_admin(user_id: int) -> bool:
@@ -299,11 +321,44 @@ def build_caption(description: str) -> str:
         f"{description}\n\n"
         f"🎯 Как участвовать:\n"
         f"1. Подпишись на канал\n"
-        f"2. Найди код в видео/посте\n"
+        f"2. Найди код в видео или посте\n"
         f"3. Отправь код в бота\n"
-        f"4. Пройди простую капчу\n\n"
+        f"4. Нажми кнопку подтверждения\n\n"
         f"👉 После этого ты участвуешь"
     )
+
+
+def user_rate_limited(user_id: int) -> Optional[str]:
+    now = time.time()
+
+    if user_id in wrong_code_attempts:
+        blocked_until = wrong_code_attempts[user_id]["until"]
+        if blocked_until > now:
+            minutes_left = int((blocked_until - now) // 60) + 1
+            return f"Слишком много неверных попыток. Попробуй через {minutes_left} мин."
+
+    last_ts = last_message_time.get(user_id, 0)
+    if now - last_ts < MESSAGE_COOLDOWN_SECONDS:
+        return "Слишком быстро. Подожди пару секунд."
+
+    last_message_time[user_id] = now
+    return None
+
+
+def register_wrong_code_attempt(user_id: int):
+    now = time.time()
+    current = wrong_code_attempts.get(user_id, {"count": 0, "until": 0})
+    current["count"] += 1
+
+    if current["count"] >= MAX_WRONG_CODE_ATTEMPTS:
+        current["until"] = now + WRONG_CODE_BLOCK_MINUTES * 60
+        current["count"] = 0
+
+    wrong_code_attempts[user_id] = current
+
+
+def reset_wrong_code_attempts(user_id: int):
+    wrong_code_attempts.pop(user_id, None)
 
 
 def admin_menu_kb() -> InlineKeyboardMarkup:
@@ -346,56 +401,37 @@ def confirm_kb() -> InlineKeyboardMarkup:
     return kb
 
 
-def make_captcha() -> Tuple[str, InlineKeyboardMarkup]:
-    a = random.randint(1, 5)
-    b = random.randint(1, 5)
-    correct = str(a + b)
-
-    options = {correct}
-    while len(options) < 3:
-        options.add(str(random.randint(2, 10)))
-
-    opts = list(options)
-    random.shuffle(opts)
-
-    kb = InlineKeyboardMarkup(row_width=3)
-    buttons = [InlineKeyboardButton(text=x, callback_data=f"captcha:{x}") for x in opts]
-    kb.add(*buttons)
-    return correct, kb
+def human_check_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("Я человек ✅", callback_data="captcha_ok"))
+    return kb
 
 
-def user_rate_limited(user_id: int) -> Optional[str]:
-    now = time.time()
+async def animate_winner_selection(participants: List[Tuple[int, str, str]]) -> str:
+    """
+    Визуальная имитация рандомайзера.
+    Возвращает итоговый текст победителя.
+    """
+    sample_names = [p[1] for p in participants]
+    msg = await bot.send_message(ADMIN_ID, "🎲 Запускаю рандомайзер...")
 
-    if user_id in wrong_code_attempts:
-        blocked_until = wrong_code_attempts[user_id]["until"]
-        if blocked_until > now:
-            minutes_left = int((blocked_until - now) // 60) + 1
-            return f"Слишком много неверных попыток. Попробуй через {minutes_left} мин."
+    steps = [
+        "🎲 Проверяю участников...",
+        "🎲 Считаю шансы...",
+        "🎲 Выбираю случайно...",
+    ]
 
-    last_ts = last_message_time.get(user_id, 0)
-    if now - last_ts < MESSAGE_COOLDOWN_SECONDS:
-        return "Слишком быстро. Подожди пару секунд."
+    for step in steps:
+        await msg.edit_text(step)
 
-    last_message_time[user_id] = now
-    return None
+    if sample_names:
+        preview_pool = sample_names[:]
+        random.shuffle(preview_pool)
+        preview_names = preview_pool[:min(3, len(preview_pool))]
+        for name in preview_names:
+            await msg.edit_text(f"🎲 {name}")
 
-
-def register_wrong_code_attempt(user_id: int):
-    now = time.time()
-    current = wrong_code_attempts.get(user_id, {"count": 0, "until": 0})
-    current["count"] += 1
-
-    if current["count"] >= MAX_WRONG_CODE_ATTEMPTS:
-        current["until"] = now + WRONG_CODE_BLOCK_MINUTES * 60
-        current["count"] = 0
-
-    wrong_code_attempts[user_id] = current
-
-
-def reset_wrong_code_attempts(user_id: int):
-    if user_id in wrong_code_attempts:
-        del wrong_code_attempts[user_id]
+    return msg.message_id
 
 
 # =========================
@@ -427,8 +463,11 @@ async def finish_giveaway(reason: str):
         )
         await post_winners_to_channel("Участников не было.")
     else:
+        message_id = await animate_winner_selection(participants)
+
         ids = [row[0] for row in participants]
         names = {row[0]: row[1] for row in participants}
+
         actual_winners_count = min(winners_count, len(ids))
         winner_ids = random.sample(ids, actual_winners_count)
 
@@ -437,6 +476,12 @@ async def finish_giveaway(reason: str):
             winners_lines.append(f"{i}. {names[winner_id]}")
 
         winners_text = "\n".join(winners_lines)
+
+        await bot.edit_message_text(
+            f"🏆 Победитель определён!\n\n{winners_text}",
+            chat_id=ADMIN_ID,
+            message_id=message_id
+        )
 
         await bot.send_message(
             ADMIN_ID,
@@ -461,6 +506,7 @@ async def finish_giveaway(reason: str):
 
 async def time_finish_worker():
     global current_giveaway
+
     while current_giveaway.get("active"):
         end_dt = parse_dt(current_giveaway.get("end_datetime"))
         if end_dt and datetime.now() >= end_dt:
@@ -535,7 +581,7 @@ async def start_cmd(message: types.Message):
         "1. Подпишись на канал\n"
         "2. Найди код\n"
         "3. Отправь код сюда\n"
-        "4. Пройди капчу"
+        "4. Подтверди, что ты человек"
     )
 
 
@@ -546,6 +592,52 @@ async def admin_cmd(message: types.Message):
     await message.answer("⚙️ Админ-меню", reply_markup=admin_menu_kb())
 
 
+@dp.message_handler(commands=["status"])
+async def status_cmd(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+
+    if not current_giveaway.get("active"):
+        await message.answer("Сейчас активного розыгрыша нет")
+        return
+
+    text = (
+        f"📊 Статус розыгрыша\n\n"
+        f"Код: {current_giveaway.get('code')}\n"
+        f"Участников: {get_participants_count()}\n"
+        f"Победителей: {current_giveaway.get('winners_count')}\n"
+        f"Завершение: {'по количеству' if current_giveaway.get('end_mode') == 'count' else 'по времени'}\n"
+    )
+
+    if current_giveaway.get("end_mode") == "count":
+        text += f"Цель: {current_giveaway.get('end_value')}"
+    else:
+        end_dt = parse_dt(current_giveaway.get("end_datetime"))
+        if end_dt:
+            text += f"До: {end_dt.strftime('%Y-%m-%d %H:%M:%S')}"
+
+    await message.answer(text)
+
+
+@dp.message_handler(commands=["cancel"])
+async def cancel_cmd(message: types.Message):
+    global current_giveaway, time_task
+
+    if not is_admin(message.from_user.id):
+        return
+
+    if time_task:
+        time_task.cancel()
+        time_task = None
+
+    clear_participants()
+    clear_passed_captcha()
+    clear_giveaway_db()
+    current_giveaway = {"active": False}
+
+    await message.answer("Активный розыгрыш отменён ❌")
+
+
 # =========================
 # ADMIN CALLBACKS
 # =========================
@@ -553,6 +645,7 @@ async def admin_cmd(message: types.Message):
 async def cb_admin_new(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
+
     if current_giveaway.get("active"):
         await callback.message.answer("Сейчас уже есть активный розыгрыш ❗")
         await callback.answer()
@@ -862,27 +955,14 @@ async def process_confirm(callback: types.CallbackQuery, state: FSMContext):
 # =========================
 # CAPTCHA
 # =========================
-@dp.callback_query_handler(lambda c: c.data.startswith("captcha:"))
+@dp.callback_query_handler(lambda c: c.data == "captcha_ok")
 async def captcha_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
-    data = pending_captcha.get(user_id)
-
-    if not data:
-        await callback.answer("Капча истекла", show_alert=True)
-        return
-
-    if time.time() > data["expires"]:
-        del pending_captcha[user_id]
-        await callback.answer("Капча истекла. Отправь код заново.", show_alert=True)
-        return
-
-    chosen = callback.data.split(":", 1)[1]
-    if chosen != data["answer"]:
-        await callback.answer("Неверно. Попробуй ещё раз.", show_alert=True)
-        return
-
     current_code = current_giveaway.get("code")
-    mark_captcha_passed(user_id, current_code)
+
+    if user_id not in pending_captcha:
+        await callback.answer("Подтверждение уже неактуально", show_alert=True)
+        return
 
     username = callback.from_user.username
     full_name = callback.from_user.full_name
@@ -891,10 +971,11 @@ async def captcha_callback(callback: types.CallbackQuery):
     if not participant_exists(user_id):
         add_participant(user_id, display_name)
 
-    del pending_captcha[user_id]
+    mark_captcha_passed(user_id, current_code)
+    pending_captcha.discard(user_id)
     reset_wrong_code_attempts(user_id)
 
-    await callback.message.edit_text("Ты прошёл проверку и участвуешь 🎉")
+    await callback.message.edit_text("Ты подтверждён и участвуешь 🎉")
     await callback.answer("Готово!")
 
     if current_giveaway.get("end_mode") == "count":
@@ -912,9 +993,6 @@ async def check_code(message: types.Message):
         return
 
     user_id = message.from_user.id
-
-    if is_admin(user_id) and message.text == "/admin":
-        return
 
     limiter_message = user_rate_limited(user_id)
     if limiter_message:
@@ -952,16 +1030,10 @@ async def check_code(message: types.Message):
         await message.answer("Ты участвуешь 🎉")
         return
 
-    correct, kb = make_captcha()
-    pending_captcha[user_id] = {
-        "answer": correct,
-        "expires": time.time() + CAPTCHA_EXPIRES_SECONDS,
-    }
-
+    pending_captcha.add(user_id)
     await message.answer(
-        "Проверка, что ты не бот 🤖\n\n"
-        "Выбери правильный ответ:",
-        reply_markup=kb
+        "Подтверди, что ты человек 👇",
+        reply_markup=human_check_kb()
     )
 
 

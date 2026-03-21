@@ -726,9 +726,13 @@ async def restore_state():
 
 
 async def on_startup(_):
+    # убираем возможный webhook (фикс ошибки двойного запуска)
+    await bot.delete_webhook(drop_pending_updates=True)
+
     init_db()
     scheduler.start()
     await restore_state()
+
     await bot.send_message(
         ADMIN_ID,
         "Бот запущен ✅\n\nВыбери действие:",

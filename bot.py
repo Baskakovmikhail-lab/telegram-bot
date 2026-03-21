@@ -585,7 +585,8 @@ async def finish_giveaway(reason: str):
             winners_lines.append(f"{medal} {names[winner_id]}")
 
         winners_text = "\n".join(winners_lines)
-                await bot.edit_message_text(
+
+        await bot.edit_message_text(
             f"🏆 Победитель определён!\n\n{winners_text}",
             chat_id=ADMIN_ID,
             message_id=msg_id
@@ -596,6 +597,7 @@ async def finish_giveaway(reason: str):
             place_text = "победитель" if i == 1 else f"в числе победителей (место {i})"
             sent = await notify_winner_in_private(winner_id, place_text)
             winner_name = names[winner_id]
+
             if sent:
                 notify_lines.append(f"✅ ЛС отправлено: {winner_name}")
             else:

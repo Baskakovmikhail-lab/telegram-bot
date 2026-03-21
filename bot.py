@@ -383,6 +383,12 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
     return kb
 
 
+def cancel_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("❌ Отмена", callback_data="setup_cancel"))
+    return kb
+
+
 def start_mode_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
@@ -416,6 +422,14 @@ def human_check_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("Подтвердить участие ✅", callback_data="captcha_ok"))
     return kb
+
+
+async def send_step_hint(message: types.Message, text: str):
+    await message.answer(f"{text}\n\nЕсли передумал — нажми «Отмена».", reply_markup=cancel_kb())
+
+
+async def send_step_hint_cb(callback: types.CallbackQuery, text: str):
+    await callback.message.answer(f"{text}\n\nЕсли передумал — нажми «Отмена».", reply_markup=cancel_kb())
 
 
 async def animate_winner_selection(participants: List[Tuple[int, str, str]]) -> int:
@@ -603,25 +617,24 @@ async def on_startup(_):
 
 
 # =========================
-# USER COMMANDS
+# ADMIN COMMANDS
 # =========================
-@dp.message_handler(commands=["start"])
-async def start_cmd(message: types.Message):
-    await message.answer(
-        "Привет 👋\n\n"
-        "Чтобы участвовать:\n"
-        "1. Подпишись на канал\n"
-        "2. Найди код\n"
-        "3. Отправь код сюда\n"
-        "4. Нажми кнопку подтверждения"
-    )
-
-
-@dp.message_handler(commands=["admin"])
-async def admin_cmd(message: types.Message):
+@dp.message_handler(commands=["admin"], state="*")
+async def admin_cmd(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
+
+    await state.finish()
     await message.answer("⚙️ Админ-меню", reply_markup=admin_menu_kb())
+
+
+@dp.message_handler(commands=["cancelsetup"], state="*")
+async def cancel_setup_cmd(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+
+    await state.finish()
+    await message.answer("Создание розыгрыша отменено ❌", reply_markup=admin_menu_kb())
 
 
 @dp.message_handler(commands=["status"])
@@ -670,6 +683,21 @@ async def cancel_cmd(message: types.Message):
 
 
 # =========================
+# USER COMMANDS
+# =========================
+@dp.message_handler(commands=["start"])
+async def start_cmd(message: types.Message):
+    await message.answer(
+        "Привет 👋\n\n"
+        "Чтобы участвовать:\n"
+        "1. Подпишись на канал\n"
+        "2. Найди код\n"
+        "3. Отправь код сюда\n"
+        "4. Нажми кнопку подтверждения"
+    )
+
+
+# =========================
 # ADMIN CALLBACKS
 # =========================
 @dp.callback_query_handler(lambda c: c.data == "admin_new")
@@ -683,9 +711,9 @@ async def cb_admin_new(callback: types.CallbackQuery):
         return
 
     await GiveawayForm.waiting_media.set()
-    await callback.message.answer(
-        "Отправь фото или видео для поста.\n\n"
-        "Можно прислать как медиа или как файл."
+    await send_step_hint_cb(
+        callback,
+        "Отправь фото или видео для поста.\n\nМожно прислать как медиа или как файл."
     )
     await callback.answer()
 
@@ -811,12 +839,12 @@ async def cb_setup_cancel(callback: types.CallbackQuery, state: FSMContext):
         return
 
     await state.finish()
-    await callback.message.answer("Создание розыгрыша отменено ❌")
+    await callback.message.answer("Создание розыгрыша отменено ❌", reply_markup=admin_menu_kb())
     await callback.answer()
 
 
 # =========================
-# СОЗДАНИЕ РОЗЫГРЫША
+# FSM: ОСНОВНОЙ FLOW
 # =========================
 @dp.message_handler(content_types=["video", "photo", "document"], state=GiveawayForm.waiting_media)
 async def process_media(message: types.Message, state: FSMContext):
@@ -839,21 +867,30 @@ async def process_media(message: types.Message, state: FSMContext):
         elif name.endswith((".jpg", ".jpeg", ".png", ".webp")):
             media_type = "photo"
         else:
-            await message.answer("Подходит только фото или видео")
+            await send_step_hint(
+                message,
+                "Подходит только фото или видео.\n\nОтправь другой файл."
+            )
             return
         file_id = message.document.file_id
     else:
-        await message.answer("Отправь фото или видео")
+        await send_step_hint(message, "Отправь фото или видео.")
         return
 
     await state.update_data(media_type=media_type, media_file_id=file_id)
     await GiveawayForm.waiting_description.set()
-    await message.answer("Теперь отправь описание поста")
+    await send_step_hint(message, "Теперь отправь описание поста")
 
 
-@dp.message_handler(state=GiveawayForm.waiting_description)
+@dp.message_handler(state=GiveawayForm.waiting_description, content_types=types.ContentTypes.TEXT)
 async def process_description(message: types.Message, state: FSMContext):
-    await state.update_data(description=message.text.strip())
+    text = (message.text or "").strip()
+
+    if not text:
+        await send_step_hint(message, "Описание не должно быть пустым. Отправь текст поста.")
+        return
+
+    await state.update_data(description=text)
     await GiveawayForm.waiting_start_mode.set()
     await message.answer("Когда запускать розыгрыш?", reply_markup=start_mode_kb())
 
@@ -867,22 +904,29 @@ async def process_start_mode(callback: types.CallbackQuery, state: FSMContext):
     else:
         await state.update_data(start_mode="scheduled")
         await GiveawayForm.waiting_start_datetime.set()
-        await callback.message.answer(
-            "Введи дату и время старта в формате:\n2026-03-20 21:30\n\n" + TIMEZONE_TEXT
+        await send_step_hint_cb(
+            callback,
+            f"Введи дату и время старта в формате:\n2026-03-20 21:30\n\n{TIMEZONE_TEXT}"
         )
     await callback.answer()
 
 
-@dp.message_handler(state=GiveawayForm.waiting_start_datetime)
+@dp.message_handler(state=GiveawayForm.waiting_start_datetime, content_types=types.ContentTypes.TEXT)
 async def process_start_datetime(message: types.Message, state: FSMContext):
     try:
         start_dt = datetime.strptime(message.text.strip(), "%Y-%m-%d %H:%M")
     except ValueError:
-        await message.answer(f"Неверный формат. Пример: 2026-03-20 21:30\n\n{TIMEZONE_TEXT}")
+        await send_step_hint(
+            message,
+            f"Неверный формат.\nПример: 2026-03-20 21:30\n\n{TIMEZONE_TEXT}"
+        )
         return
 
     if start_dt <= datetime.now():
-        await message.answer(f"Время старта должно быть в будущем\n\n{TIMEZONE_TEXT}")
+        await send_step_hint(
+            message,
+            f"Время старта должно быть в будущем.\n\n{TIMEZONE_TEXT}"
+        )
         return
 
     await state.update_data(start_datetime=start_dt.isoformat())
@@ -894,55 +938,60 @@ async def process_start_datetime(message: types.Message, state: FSMContext):
 async def process_end_mode(callback: types.CallbackQuery, state: FSMContext):
     if callback.data == "end_count":
         await state.update_data(end_mode="count")
-        await callback.message.answer("Сколько участников должно быть до завершения?")
+        await GiveawayForm.waiting_end_value.set()
+        await send_step_hint_cb(
+            callback,
+            "Сколько участников должно быть до завершения?"
+        )
     else:
         await state.update_data(end_mode="time")
-        await callback.message.answer(
-            "Сколько минут должен идти розыгрыш после старта?\n\n" + TIMEZONE_TEXT
+        await GiveawayForm.waiting_end_value.set()
+        await send_step_hint_cb(
+            callback,
+            f"Сколько минут должен идти розыгрыш после старта?\n\n{TIMEZONE_TEXT}"
         )
-    await GiveawayForm.waiting_end_value.set()
     await callback.answer()
 
 
-@dp.message_handler(state=GiveawayForm.waiting_end_value)
+@dp.message_handler(state=GiveawayForm.waiting_end_value, content_types=types.ContentTypes.TEXT)
 async def process_end_value(message: types.Message, state: FSMContext):
     try:
         value = int(message.text.strip())
     except ValueError:
-        await message.answer("Нужно ввести число")
+        await send_step_hint(message, "Нужно ввести число.")
         return
 
     if value <= 0:
-        await message.answer("Число должно быть больше нуля")
+        await send_step_hint(message, "Число должно быть больше нуля.")
         return
 
     await state.update_data(end_value=value)
     await GiveawayForm.waiting_winners_count.set()
-    await message.answer("Сколько победителей выбрать?")
+    await send_step_hint(message, "Сколько победителей выбрать?")
 
 
-@dp.message_handler(state=GiveawayForm.waiting_winners_count)
+@dp.message_handler(state=GiveawayForm.waiting_winners_count, content_types=types.ContentTypes.TEXT)
 async def process_winners_count(message: types.Message, state: FSMContext):
     try:
         winners_count = int(message.text.strip())
     except ValueError:
-        await message.answer("Нужно ввести число")
+        await send_step_hint(message, "Нужно ввести число.")
         return
 
     if winners_count <= 0:
-        await message.answer("Количество победителей должно быть больше нуля")
+        await send_step_hint(message, "Количество победителей должно быть больше нуля.")
         return
 
     await state.update_data(winners_count=winners_count)
     await GiveawayForm.waiting_code.set()
-    await message.answer("Теперь отправь код, который участники будут вводить в бота")
+    await send_step_hint(message, "Теперь отправь код, который участники будут вводить в бота")
 
 
-@dp.message_handler(state=GiveawayForm.waiting_code)
+@dp.message_handler(state=GiveawayForm.waiting_code, content_types=types.ContentTypes.TEXT)
 async def process_code(message: types.Message, state: FSMContext):
     code = message.text.strip()
     if not code:
-        await message.answer("Код не должен быть пустым")
+        await send_step_hint(message, "Код не должен быть пустым.")
         return
 
     data = await state.get_data()
@@ -977,13 +1026,109 @@ async def process_code(message: types.Message, state: FSMContext):
     await message.answer(summary, reply_markup=confirm_kb())
 
 
+# =========================
+# FSM: FALLBACK ДЛЯ АДМИНА
+# =========================
+@dp.message_handler(state=GiveawayForm.waiting_media)
+async def fallback_waiting_media(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await send_step_hint(
+        message,
+        "Сейчас бот ждёт фото или видео для поста."
+    )
+
+
+@dp.message_handler(state=GiveawayForm.waiting_description)
+async def fallback_waiting_description(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await send_step_hint(
+        message,
+        "Сейчас бот ждёт описание поста текстом."
+    )
+
+
+@dp.message_handler(state=GiveawayForm.waiting_start_mode)
+async def fallback_waiting_start_mode(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(
+        "Сейчас выбери способ старта кнопками ниже.\n\nЕсли передумал — нажми «Отмена».",
+        reply_markup=start_mode_kb()
+    )
+
+
+@dp.message_handler(state=GiveawayForm.waiting_start_datetime)
+async def fallback_waiting_start_datetime(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await send_step_hint(
+        message,
+        f"Сейчас бот ждёт дату и время старта в формате:\n2026-03-20 21:30\n\n{TIMEZONE_TEXT}"
+    )
+
+
+@dp.message_handler(state=GiveawayForm.waiting_end_mode)
+async def fallback_waiting_end_mode(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(
+        "Сейчас выбери способ завершения кнопками ниже.\n\nЕсли передумал — нажми «Отмена».",
+        reply_markup=end_mode_kb()
+    )
+
+
+@dp.message_handler(state=GiveawayForm.waiting_end_value)
+async def fallback_waiting_end_value(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await send_step_hint(
+        message,
+        "Сейчас бот ждёт число для завершения розыгрыша."
+    )
+
+
+@dp.message_handler(state=GiveawayForm.waiting_winners_count)
+async def fallback_waiting_winners_count(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await send_step_hint(
+        message,
+        "Сейчас бот ждёт количество победителей."
+    )
+
+
+@dp.message_handler(state=GiveawayForm.waiting_code)
+async def fallback_waiting_code(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await send_step_hint(
+        message,
+        "Сейчас бот ждёт код для участников."
+    )
+
+
+@dp.message_handler(state=GiveawayForm.waiting_confirm)
+async def fallback_waiting_confirm(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer(
+        "Сейчас проверь настройки и нажми одну из кнопок ниже.\n\nЕсли передумал — нажми «Отмена».",
+        reply_markup=confirm_kb()
+    )
+
+
+# =========================
+# ПОДТВЕРЖДЕНИЕ РОЗЫГРЫША
+# =========================
 @dp.callback_query_handler(lambda c: c.data in ["confirm_yes", "confirm_no"], state=GiveawayForm.waiting_confirm)
 async def process_confirm(callback: types.CallbackQuery, state: FSMContext):
     global current_giveaway
 
     if callback.data == "confirm_no":
         await state.finish()
-        await callback.message.answer("Создание розыгрыша отменено ❌")
+        await callback.message.answer("Создание розыгрыша отменено ❌", reply_markup=admin_menu_kb())
         await callback.answer()
         return
 
@@ -1018,7 +1163,7 @@ async def process_confirm(callback: types.CallbackQuery, state: FSMContext):
 
     save_giveaway(current_giveaway)
 
-    # предпросмотр поста
+    # предпросмотр
     caption = build_caption(current_giveaway["description"])
     if current_giveaway["media_type"] == "video":
         await bot.send_video(ADMIN_ID, current_giveaway["media_file_id"], caption=caption)

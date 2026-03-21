@@ -502,20 +502,56 @@ async def notify_winner_in_private(user_id: int, place_text: str, chosen_number:
         return False
 
 
-async def post_winners_to_channel(winners_text: str, winners_count: int):
-    winners_label = "Победитель" if winners_count == 1 else "Победители"
-
+async def animate_winners_in_channel(winner_rows: List[Tuple[int, str, str, Optional[int]]]):
     try:
-        await bot.send_message(
+        msg = await bot.send_message(
             CHANNEL_ID,
-            f"🏆 РОЗЫГРЫШ ЗАВЕРШЁН\n\n"
-            f"{winners_label}:\n{winners_text}\n\n"
-            f"💸 Приз: 1000₽\n\n"
-            f"Спасибо всем за участие 🔥\n"
-            f"Скоро новый розыгрыш"
+            "🎲 Определяем победителя..."
         )
+
+        if len(winner_rows) == 1:
+            _, winner_name, _, winner_number = winner_rows[0]
+
+            for _ in range(12):
+                fake_number = random.randint(NUMBER_MIN, NUMBER_MAX)
+                await asyncio.sleep(0.35)
+                await msg.edit_text(
+                    f"🎲 Определяем победителя...\n\n"
+                    f"Число: {fake_number}"
+                )
+
+            await asyncio.sleep(0.4)
+            await msg.edit_text(
+                f"🏆 Победитель определён!\n\n"
+                f"Выигрышное число: {winner_number}\n"
+                f"Победитель: {winner_name}"
+            )
+            return
+
+        lines = []
+        for index, (_, winner_name, _, winner_number) in enumerate(winner_rows, start=1):
+            for _ in range(8):
+                fake_number = random.randint(NUMBER_MIN, NUMBER_MAX)
+                await asyncio.sleep(0.25)
+                await msg.edit_text(
+                    f"🎲 Определяем победителей...\n\n"
+                    f"Раунд {index}/{len(winner_rows)}\n"
+                    f"Число: {fake_number}"
+                )
+
+            lines.append(f"{index}. Число: {winner_number} — {winner_name}")
+            await asyncio.sleep(0.35)
+            await msg.edit_text(
+                "🏆 Победители определяются...\n\n" + "\n".join(lines)
+            )
+
+        await asyncio.sleep(0.4)
+        await msg.edit_text(
+            "🏆 Победители определены!\n\n" + "\n".join(lines)
+        )
+
     except Exception as e:
-        await bot.send_message(ADMIN_ID, f"Не удалось отправить победителей в канал: {e}")
+        await bot.send_message(ADMIN_ID, f"Не удалось показать анимацию победителя в канал: {e}")
 
 
 async def remove_finish_job():
@@ -602,7 +638,7 @@ async def finish_giveaway(reason: str):
             reply_markup=admin_menu_kb()
         )
 
-        await post_winners_to_channel(winners_text, actual_winners_count)
+        await animate_winners_in_channel(winner_rows)
 
     current_giveaway = {"active": False}
     clear_participants()

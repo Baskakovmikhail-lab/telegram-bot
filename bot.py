@@ -589,7 +589,7 @@ async def finish_giveaway(reason: str):
         winners_text = "\n".join(winners_lines)
         
         
-                await bot.edit_message_text(
+        await bot.edit_message_text(
             f"🏆 Победитель определён!\n\n{winners_text}",
             chat_id=ADMIN_ID,
             message_id=msg_id

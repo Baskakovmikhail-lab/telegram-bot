@@ -43,6 +43,7 @@ WRONG_CODE_BLOCK_MINUTES = 10
 
 NUMBER_MIN = 1
 NUMBER_MAX = 100
+NUMBER_BUTTONS_COUNT = 3
 
 logging.basicConfig(level=logging.INFO)
 
@@ -267,17 +268,23 @@ def clear_giveaway_db():
     conn.close()
 
 
-def add_participant(user_id: int, username: str, chosen_number: int):
+def add_participant(user_id: int, username: str, chosen_number: int) -> bool:
     conn = get_conn()
     cur = conn.cursor()
+    ok = True
 
-    cur.execute("""
-        INSERT OR IGNORE INTO participants (user_id, username, joined_at, chosen_number)
-        VALUES (?, ?, ?, ?)
-    """, (user_id, username, now_utc3().isoformat(), chosen_number))
+    try:
+        cur.execute("""
+            INSERT INTO participants (user_id, username, joined_at, chosen_number)
+            VALUES (?, ?, ?, ?)
+        """, (user_id, username, now_utc3().isoformat(), chosen_number))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        ok = False
+    finally:
+        conn.close()
 
-    conn.commit()
-    conn.close()
+    return ok
 
 
 def participant_exists(user_id: int) -> bool:
@@ -311,6 +318,19 @@ def number_is_taken(number: int) -> bool:
 
     conn.close()
     return row is not None
+
+
+def get_free_numbers() -> List[int]:
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT chosen_number FROM participants WHERE chosen_number IS NOT NULL")
+    taken_rows = cur.fetchall()
+
+    conn.close()
+
+    taken = {row[0] for row in taken_rows if row[0] is not None}
+    return [n for n in range(NUMBER_MIN, NUMBER_MAX + 1) if n not in taken]
 
 
 def get_participants() -> List[Tuple[int, str, str, Optional[int]]]:
@@ -444,6 +464,19 @@ def publish_preview_kb() -> InlineKeyboardMarkup:
     return kb
 
 
+def choose_number_kb() -> InlineKeyboardMarkup:
+    free_numbers = get_free_numbers()
+    kb = InlineKeyboardMarkup(row_width=3)
+
+    if free_numbers:
+        picks = random.sample(free_numbers, min(NUMBER_BUTTONS_COUNT, len(free_numbers)))
+        buttons = [InlineKeyboardButton(str(num), callback_data=f"picknum_{num}") for num in picks]
+        kb.add(*buttons)
+        kb.add(InlineKeyboardButton("🎲 Дай случайный номер", callback_data="picknum_random"))
+
+    return kb
+
+
 async def send_step_hint(message: types.Message, text: str):
     await message.answer(
         f"{text}\n\nЕсли передумал — нажми «Отмена».",
@@ -495,21 +528,24 @@ async def animate_winners_in_channel(winner_rows: List[Tuple[int, str, str, Opti
 
         if len(winner_rows) == 1:
             _, winner_name, _, winner_number = winner_rows[0]
+            speeds = [0.08, 0.08, 0.1, 0.12, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5]
 
-            for _ in range(12):
+            for delay in speeds:
                 fake_number = random.randint(NUMBER_MIN, NUMBER_MAX)
                 new_text = f"🎲 Определяем победителя...\n\nЧисло: {fake_number}"
 
                 if new_text == last_text:
                     continue
 
-                await asyncio.sleep(0.35)
+                await asyncio.sleep(delay)
                 try:
                     await msg.edit_text(new_text)
                     last_text = new_text
                 except Exception as e:
                     if "Message is not modified" not in str(e):
                         raise
+
+            await asyncio.sleep(0.7)
 
             final_text = (
                 f"🏆 Победитель определён!\n\n"
@@ -523,14 +559,16 @@ async def animate_winners_in_channel(winner_rows: List[Tuple[int, str, str, Opti
 
         lines = []
         for i, (_, name, _, num) in enumerate(winner_rows, start=1):
-            for _ in range(8):
+            speeds = [0.08, 0.1, 0.12, 0.16, 0.22, 0.3, 0.4]
+
+            for delay in speeds:
                 fake = random.randint(NUMBER_MIN, NUMBER_MAX)
                 new_text = f"🎲 Раунд {i}/{len(winner_rows)}\nЧисло: {fake}"
 
                 if new_text == last_text:
                     continue
 
-                await asyncio.sleep(0.25)
+                await asyncio.sleep(delay)
                 try:
                     await msg.edit_text(new_text)
                     last_text = new_text
@@ -544,6 +582,8 @@ async def animate_winners_in_channel(winner_rows: List[Tuple[int, str, str, Opti
             if round_text != last_text:
                 await msg.edit_text(round_text)
                 last_text = round_text
+
+        await asyncio.sleep(0.7)
 
         final_text = "🏆 Победители определены!\n\n" + "\n".join(lines)
         if final_text != last_text:
@@ -587,6 +627,37 @@ async def remove_start_job():
         start_job_id = None
 
 
+async def ask_for_number_choice(target: types.Union[types.Message, types.CallbackQuery], resend: bool = False):
+    free_numbers = get_free_numbers()
+
+    if not free_numbers:
+        text = "Свободных номеров не осталось ❌"
+        if isinstance(target, types.CallbackQuery):
+            await target.message.answer(text)
+        else:
+            await target.answer(text)
+        return
+
+    if len(free_numbers) <= 10:
+        free_hint = ", ".join(map(str, free_numbers))
+        base_text = (
+            f"Код принят ✅\n\n"
+            f"Выбери свой номер от {NUMBER_MIN} до {NUMBER_MAX}.\n"
+            f"Свободные числа:\n{free_hint}"
+        )
+    else:
+        base_text = (
+            f"{'Выбери другой номер.' if resend else 'Код принят ✅'}\n\n"
+            f"Выбери свой номер от {NUMBER_MIN} до {NUMBER_MAX}\n"
+            f"или нажми «🎲 Дай случайный номер»."
+        )
+
+    if isinstance(target, types.CallbackQuery):
+        await target.message.answer(base_text, reply_markup=choose_number_kb())
+    else:
+        await target.answer(base_text, reply_markup=choose_number_kb())
+
+
 # =========================
 # GIVEAWAY CORE
 # =========================
@@ -616,7 +687,7 @@ async def finish_giveaway(reason: str):
         medals = ["🥇", "🥈", "🥉"]
         winners_lines = []
 
-        for i, (winner_id, winner_name, _, chosen_number) in enumerate(winner_rows, start=1):
+        for i, (_, winner_name, _, chosen_number) in enumerate(winner_rows, start=1):
             medal = medals[i - 1] if i <= len(medals) else f"{i}."
             number_text = f" — №{chosen_number}" if chosen_number is not None else ""
             winners_lines.append(f"{medal} {winner_name}{number_text}")
@@ -1116,6 +1187,71 @@ async def cb_publish_cancel(callback: types.CallbackQuery):
 
 
 # =========================
+# ВЫБОР НОМЕРА ЧЕРЕЗ КНОПКИ
+# =========================
+@dp.callback_query_handler(lambda c: c.data.startswith("picknum_"), state=NumberChoiceForm.waiting_number)
+async def cb_pick_number(callback: types.CallbackQuery, state: FSMContext):
+    if not current_giveaway.get("active"):
+        pending_number_choice.discard(callback.from_user.id)
+        await state.finish()
+        await callback.message.answer("Сейчас нет активного розыгрыша")
+        await callback.answer()
+        return
+
+    user_id = callback.from_user.id
+
+    if user_id not in pending_number_choice:
+        await state.finish()
+        await callback.answer("Сначала отправь код для участия", show_alert=True)
+        return
+
+    free_numbers = get_free_numbers()
+    if not free_numbers:
+        pending_number_choice.discard(user_id)
+        await state.finish()
+        await callback.message.answer("Свободных номеров не осталось ❌")
+        await callback.answer()
+        return
+
+    data = callback.data
+
+    if data == "picknum_random":
+        chosen_number = random.choice(free_numbers)
+    else:
+        chosen_number = int(data.split("_")[1])
+
+    if chosen_number not in free_numbers:
+        await callback.answer("Этот номер уже занят", show_alert=True)
+        await ask_for_number_choice(callback, resend=True)
+        return
+
+    username = callback.from_user.username
+    full_name = callback.from_user.full_name
+    display_name = f"@{username}" if username else full_name
+
+    ok = add_participant(user_id, display_name, chosen_number)
+    if not ok:
+        await callback.answer("Этот номер только что заняли", show_alert=True)
+        await ask_for_number_choice(callback, resend=True)
+        return
+
+    pending_number_choice.discard(user_id)
+    reset_wrong_code_attempts(user_id)
+    await state.finish()
+
+    await callback.message.answer(
+        f"Готово ✅\n"
+        f"Ты участвуешь в розыгрыше\n"
+        f"Твой номер: {chosen_number}"
+    )
+    await callback.answer("Номер закреплён")
+
+    if current_giveaway.get("end_mode") == "count":
+        if get_participants_count() >= current_giveaway.get("end_value"):
+            await finish_giveaway("набрано нужное количество участников")
+
+
+# =========================
 # FSM: ОСНОВНОЙ FLOW
 # =========================
 @dp.message_handler(content_types=["video", "photo", "document"], state=GiveawayForm.waiting_media)
@@ -1418,7 +1554,7 @@ async def fallback_waiting_code(message: types.Message):
 
 
 # =========================
-# ВЫБОР ПЕРСОНАЛЬНОГО НОМЕРА
+# ВЫБОР ПЕРСОНАЛЬНОГО НОМЕРА ТЕКСТОМ
 # =========================
 @dp.message_handler(state=NumberChoiceForm.waiting_number, content_types=types.ContentTypes.TEXT)
 async def process_personal_number(message: types.Message, state: FSMContext):
@@ -1438,22 +1574,58 @@ async def process_personal_number(message: types.Message, state: FSMContext):
     try:
         chosen_number = int((message.text or "").strip())
     except ValueError:
-        await message.answer(f"Отправь число от {NUMBER_MIN} до {NUMBER_MAX}.")
+        await message.answer(
+            f"Отправь число от {NUMBER_MIN} до {NUMBER_MAX} "
+            f"или нажми одну из кнопок ниже.",
+            reply_markup=choose_number_kb()
+        )
         return
 
     if chosen_number < NUMBER_MIN or chosen_number > NUMBER_MAX:
-        await message.answer(f"Номер должен быть от {NUMBER_MIN} до {NUMBER_MAX}.")
+        await message.answer(
+            f"Номер должен быть от {NUMBER_MIN} до {NUMBER_MAX}.",
+            reply_markup=choose_number_kb()
+        )
         return
 
     if number_is_taken(chosen_number):
-        await message.answer(f"Номер {chosen_number} уже занят ❌\nВыбери другой.")
+        free_numbers = get_free_numbers()
+
+        if not free_numbers:
+            await message.answer("Свободных номеров не осталось ❌")
+            pending_number_choice.discard(user_id)
+            await state.finish()
+            return
+
+        if len(free_numbers) <= 10:
+            hint = ", ".join(map(str, free_numbers))
+            await message.answer(
+                f"Номер {chosen_number} уже занят ❌\n\n"
+                f"Свободные числа:\n{hint}",
+                reply_markup=choose_number_kb()
+            )
+        else:
+            sample = random.sample(free_numbers, min(5, len(free_numbers)))
+            hint = ", ".join(map(str, sample))
+            await message.answer(
+                f"Номер {chosen_number} уже занят ❌\n\n"
+                f"Попробуй одно из этих:\n{hint}",
+                reply_markup=choose_number_kb()
+            )
         return
 
     username = message.from_user.username
     full_name = message.from_user.full_name
     display_name = f"@{username}" if username else full_name
 
-    add_participant(user_id, display_name, chosen_number)
+    ok = add_participant(user_id, display_name, chosen_number)
+    if not ok:
+        await message.answer(
+            "Этот номер только что заняли ❌\nВыбери другой.",
+            reply_markup=choose_number_kb()
+        )
+        return
+
     pending_number_choice.discard(user_id)
     reset_wrong_code_attempts(user_id)
 
@@ -1511,10 +1683,7 @@ async def check_code(message: types.Message):
 
     pending_number_choice.add(user_id)
     await NumberChoiceForm.waiting_number.set()
-    await message.answer(
-        f"Код принят ✅\n\n"
-        f"Теперь выбери свой номер от {NUMBER_MIN} до {NUMBER_MAX}."
-    )
+    await ask_for_number_choice(message)
 
 
 if __name__ == "__main__":

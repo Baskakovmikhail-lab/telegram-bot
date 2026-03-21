@@ -41,6 +41,9 @@ MESSAGE_COOLDOWN_SECONDS = 2
 MAX_WRONG_CODE_ATTEMPTS = 5
 WRONG_CODE_BLOCK_MINUTES = 10
 
+NUMBER_MIN = 1
+NUMBER_MAX = 100
+
 logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=API_TOKEN)
@@ -56,6 +59,7 @@ print("БОТ ЗАПУЩЕН ✅")
 # =========================
 last_message_time = {}   # user_id -> timestamp
 wrong_code_attempts = {} # user_id -> {"count": int, "until": timestamp}
+pending_number_choice = set()
 
 current_giveaway = {}
 finish_job_id = None
@@ -75,6 +79,10 @@ class GiveawayForm(StatesGroup):
     waiting_end_datetime = State()
     waiting_winners_count = State()
     waiting_code = State()
+
+
+class NumberChoiceForm(StatesGroup):
+    waiting_number = State()
 
 
 # =========================
@@ -145,13 +153,19 @@ def init_db():
         CREATE TABLE IF NOT EXISTS participants (
             user_id INTEGER PRIMARY KEY,
             username TEXT,
-            joined_at TEXT
+            joined_at TEXT,
+            chosen_number INTEGER UNIQUE
         )
     """)
 
     cur.execute("""
         INSERT OR IGNORE INTO giveaway (id, active) VALUES (1, 0)
     """)
+
+    try:
+        cur.execute("ALTER TABLE participants ADD COLUMN chosen_number INTEGER UNIQUE")
+    except sqlite3.OperationalError:
+        pass
 
     conn.commit()
     conn.close()
@@ -253,14 +267,14 @@ def clear_giveaway_db():
     conn.close()
 
 
-def add_participant(user_id: int, username: str):
+def add_participant(user_id: int, username: str, chosen_number: int):
     conn = get_conn()
     cur = conn.cursor()
 
     cur.execute("""
-        INSERT OR IGNORE INTO participants (user_id, username, joined_at)
-        VALUES (?, ?, ?)
-    """, (user_id, username, now_utc3().isoformat()))
+        INSERT OR IGNORE INTO participants (user_id, username, joined_at, chosen_number)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, username, now_utc3().isoformat(), chosen_number))
 
     conn.commit()
     conn.close()
@@ -277,12 +291,34 @@ def participant_exists(user_id: int) -> bool:
     return row is not None
 
 
-def get_participants() -> List[Tuple[int, str, str]]:
+def get_participant_number(user_id: int) -> Optional[int]:
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT chosen_number FROM participants WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+
+    conn.close()
+    return row[0] if row and row[0] is not None else None
+
+
+def number_is_taken(number: int) -> bool:
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute("SELECT 1 FROM participants WHERE chosen_number = ?", (number,))
+    row = cur.fetchone()
+
+    conn.close()
+    return row is not None
+
+
+def get_participants() -> List[Tuple[int, str, str, Optional[int]]]:
     conn = get_conn()
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT user_id, username, joined_at
+        SELECT user_id, username, joined_at, chosen_number
         FROM participants
         ORDER BY joined_at ASC
     """)
@@ -422,7 +458,7 @@ async def send_step_hint_cb(callback: types.CallbackQuery, text: str):
     )
 
 
-async def animate_winner_selection(participants: List[Tuple[int, str, str]]) -> int:
+async def animate_winner_selection(participants: List[Tuple[int, str, str, Optional[int]]]) -> int:
     msg = await bot.send_message(ADMIN_ID, "🎲 Запускаю рандомайзер...")
 
     steps = [
@@ -435,7 +471,13 @@ async def animate_winner_selection(participants: List[Tuple[int, str, str]]) -> 
         await asyncio.sleep(0.8)
         await msg.edit_text(step)
 
-    preview_names = [p[1] for p in participants]
+    preview_names = []
+    for _, username, _, chosen_number in participants:
+        if chosen_number is not None:
+            preview_names.append(f"{username} — №{chosen_number}")
+        else:
+            preview_names.append(username)
+
     random.shuffle(preview_names)
     preview_names = preview_names[:min(3, len(preview_names))]
 
@@ -446,12 +488,13 @@ async def animate_winner_selection(participants: List[Tuple[int, str, str]]) -> 
     return msg.message_id
 
 
-async def notify_winner_in_private(user_id: int, place_text: str) -> bool:
+async def notify_winner_in_private(user_id: int, place_text: str, chosen_number: Optional[int]) -> bool:
+    number_text = f"\nТвой выигравший номер: {chosen_number}" if chosen_number is not None else ""
     try:
         await bot.send_message(
             user_id,
             f"🎉 Поздравляем!\n"
-            f"Ты {place_text} в розыгрыше.\n\n"
+            f"Ты {place_text} в розыгрыше.{number_text}\n\n"
             f"Напиши администратору для получения приза."
         )
         return True
@@ -518,32 +561,23 @@ async def finish_giveaway(reason: str):
     else:
         msg_id = await animate_winner_selection(participants)
 
-        ids = [row[0] for row in participants]
-        names = {row[0]: row[1] for row in participants}
-
-        actual_winners_count = min(winners_count, len(ids))
-        winner_ids = random.sample(ids, actual_winners_count)
+        actual_winners_count = min(winners_count, len(participants))
+        winner_rows = random.sample(participants, actual_winners_count)
 
         medals = ["🥇", "🥈", "🥉"]
         winners_lines = []
 
-        for i, winner_id in enumerate(winner_ids, start=1):
+        for i, (winner_id, winner_name, _, chosen_number) in enumerate(winner_rows, start=1):
             medal = medals[i - 1] if i <= len(medals) else f"{i}."
-            winners_lines.append(f"{medal} {names[winner_id]}")
+            number_text = f" — №{chosen_number}" if chosen_number is not None else ""
+            winners_lines.append(f"{medal} {winner_name}{number_text}")
 
         winners_text = "\n".join(winners_lines)
 
-        await bot.edit_message_text(
-            f"🏆 Победитель определён!\n\n{winners_text}",
-            chat_id=ADMIN_ID,
-            message_id=msg_id
-        )
-
         notify_lines = []
-        for i, winner_id in enumerate(winner_ids, start=1):
+        for i, (winner_id, winner_name, _, chosen_number) in enumerate(winner_rows, start=1):
             place_text = "победитель" if i == 1 else f"в числе победителей (место {i})"
-            sent = await notify_winner_in_private(winner_id, place_text)
-            winner_name = names[winner_id]
+            sent = await notify_winner_in_private(winner_id, place_text, chosen_number)
 
             if sent:
                 notify_lines.append(f"✅ ЛС отправлено: {winner_name}")
@@ -551,6 +585,11 @@ async def finish_giveaway(reason: str):
                 notify_lines.append(f"⚠️ Не удалось написать в ЛС: {winner_name}")
 
         notify_text = "\n".join(notify_lines) if notify_lines else "—"
+
+        try:
+            await bot.delete_message(chat_id=ADMIN_ID, message_id=msg_id)
+        except Exception:
+            pass
 
         await bot.send_message(
             ADMIN_ID,
@@ -568,12 +607,14 @@ async def finish_giveaway(reason: str):
     current_giveaway = {"active": False}
     clear_participants()
     clear_giveaway_db()
+    pending_number_choice.clear()
 
 
 async def start_giveaway():
     global current_giveaway, finish_job_id
 
     clear_participants()
+    pending_number_choice.clear()
 
     media_type = current_giveaway["media_type"]
     media_file_id = current_giveaway["media_file_id"]
@@ -693,6 +734,7 @@ async def cancel_cmd(message: types.Message):
     clear_participants()
     clear_giveaway_db()
     current_giveaway = {"active": False}
+    pending_number_choice.clear()
 
     await message.answer("Розыгрыш отменён ❌", reply_markup=admin_menu_kb())
 
@@ -714,7 +756,8 @@ async def start_cmd(message: types.Message):
         "Чтобы участвовать:\n"
         "1. Подпишись на канал\n"
         "2. Найди код\n"
-        "3. Отправь код сюда"
+        "3. Отправь код сюда\n"
+        f"4. Выбери номер от {NUMBER_MIN} до {NUMBER_MAX}"
     )
 
 
@@ -757,6 +800,7 @@ async def status_cmd(message: types.Message):
                 f"Старт: {format_dt(parse_dt(current_giveaway.get('start_datetime')))}\n"
                 f"Завершение: {finish_text}\n"
                 f"Победителей: {current_giveaway.get('winners_count')}\n"
+                f"Номера: {NUMBER_MIN}–{NUMBER_MAX}\n"
                 f"{TIMEZONE_TEXT}",
                 reply_markup=admin_menu_kb()
             )
@@ -770,6 +814,7 @@ async def status_cmd(message: types.Message):
         f"Код: {current_giveaway.get('code')}\n"
         f"Участников: {get_participants_count()}\n"
         f"Победителей: {current_giveaway.get('winners_count')}\n"
+        f"Номера: {NUMBER_MIN}–{NUMBER_MAX}\n"
     )
 
     if current_giveaway.get("end_mode") == "count":
@@ -818,6 +863,7 @@ async def cb_admin_active(callback: types.CallbackQuery):
                 f"Код: {current_giveaway.get('code')}\n"
                 f"Старт: {format_dt(parse_dt(current_giveaway.get('start_datetime')))}\n"
                 f"Победителей: {current_giveaway.get('winners_count')}\n"
+                f"Номера: {NUMBER_MIN}–{NUMBER_MAX}\n"
             )
 
             if current_giveaway.get("end_mode") == "count":
@@ -843,6 +889,7 @@ async def cb_admin_active(callback: types.CallbackQuery):
         f"Код: {current_giveaway.get('code')}\n"
         f"Участников: {get_participants_count()}\n"
         f"Победителей: {current_giveaway.get('winners_count')}\n"
+        f"Номера: {NUMBER_MIN}–{NUMBER_MAX}\n"
     )
 
     if current_giveaway.get("end_mode") == "count":
@@ -888,6 +935,7 @@ async def cb_admin_status(callback: types.CallbackQuery):
                 f"Старт: {format_dt(parse_dt(current_giveaway.get('start_datetime')))}\n"
                 f"Завершение: {finish_text}\n"
                 f"Победителей: {current_giveaway.get('winners_count')}\n"
+                f"Номера: {NUMBER_MIN}–{NUMBER_MAX}\n"
                 f"{TIMEZONE_TEXT}"
             )
             await callback.answer()
@@ -902,6 +950,7 @@ async def cb_admin_status(callback: types.CallbackQuery):
         f"Код: {current_giveaway.get('code')}\n"
         f"Участников: {get_participants_count()}\n"
         f"Победителей: {current_giveaway.get('winners_count')}\n"
+        f"Номера: {NUMBER_MIN}–{NUMBER_MAX}\n"
     )
 
     if current_giveaway.get("end_mode") == "count":
@@ -926,8 +975,9 @@ async def cb_admin_list(callback: types.CallbackQuery):
         return
 
     lines = ["🧾 Список участников:\n"]
-    for i, (_, username, joined_at) in enumerate(participants[:50], start=1):
-        lines.append(f"{i}. {username} — {format_dt(parse_dt(joined_at))}")
+    for i, (_, username, joined_at, chosen_number) in enumerate(participants[:50], start=1):
+        number_text = f"№{chosen_number}" if chosen_number is not None else "без номера"
+        lines.append(f"{i}. {username} — {number_text} — {format_dt(parse_dt(joined_at))}")
 
     if len(participants) > 50:
         lines.append(f"\nИ ещё {len(participants) - 50} участников...")
@@ -949,6 +999,7 @@ async def cb_admin_cancel(callback: types.CallbackQuery):
     clear_participants()
     clear_giveaway_db()
     current_giveaway = {"active": False}
+    pending_number_choice.clear()
 
     await callback.message.answer("Активный или запланированный розыгрыш отменён ❌", reply_markup=admin_menu_kb())
     await callback.answer()
@@ -1317,6 +1368,58 @@ async def fallback_waiting_code(message: types.Message):
 
 
 # =========================
+# ВЫБОР ПЕРСОНАЛЬНОГО НОМЕРА
+# =========================
+@dp.message_handler(state=NumberChoiceForm.waiting_number, content_types=types.ContentTypes.TEXT)
+async def process_personal_number(message: types.Message, state: FSMContext):
+    if not current_giveaway.get("active"):
+        pending_number_choice.discard(message.from_user.id)
+        await state.finish()
+        await message.answer("Сейчас нет активного розыгрыша")
+        return
+
+    user_id = message.from_user.id
+
+    if user_id not in pending_number_choice:
+        await state.finish()
+        await message.answer("Сначала отправь код для участия.")
+        return
+
+    try:
+        chosen_number = int((message.text or "").strip())
+    except ValueError:
+        await message.answer(f"Отправь число от {NUMBER_MIN} до {NUMBER_MAX}.")
+        return
+
+    if chosen_number < NUMBER_MIN or chosen_number > NUMBER_MAX:
+        await message.answer(f"Номер должен быть от {NUMBER_MIN} до {NUMBER_MAX}.")
+        return
+
+    if number_is_taken(chosen_number):
+        await message.answer(f"Номер {chosen_number} уже занят ❌\nВыбери другой.")
+        return
+
+    username = message.from_user.username
+    full_name = message.from_user.full_name
+    display_name = f"@{username}" if username else full_name
+
+    add_participant(user_id, display_name, chosen_number)
+    pending_number_choice.discard(user_id)
+    reset_wrong_code_attempts(user_id)
+
+    await state.finish()
+    await message.answer(
+        f"Готово ✅\n"
+        f"Ты участвуешь в розыгрыше\n"
+        f"Твой номер: {chosen_number}"
+    )
+
+    if current_giveaway.get("end_mode") == "count":
+        if get_participants_count() >= current_giveaway.get("end_value"):
+            await finish_giveaway("набрано нужное количество участников")
+
+
+# =========================
 # УЧАСТИЕ ПОЛЬЗОВАТЕЛЯ
 # =========================
 @dp.message_handler()
@@ -1351,21 +1454,17 @@ async def check_code(message: types.Message):
         return
 
     if participant_exists(user_id):
-        await message.answer("Ты уже участвуешь в этом розыгрыше 🎉")
+        chosen_number = get_participant_number(user_id)
+        number_text = f"\nТвой номер: {chosen_number}" if chosen_number is not None else ""
+        await message.answer(f"Ты уже участвуешь в этом розыгрыше 🎉{number_text}")
         return
 
-    username = message.from_user.username
-    full_name = message.from_user.full_name
-    display_name = f"@{username}" if username else full_name
-
-    add_participant(user_id, display_name)
-    reset_wrong_code_attempts(user_id)
-
-    await message.answer("Готово ✅\nТы участвуешь в розыгрыше")
-
-    if current_giveaway.get("end_mode") == "count":
-        if get_participants_count() >= current_giveaway.get("end_value"):
-            await finish_giveaway("набрано нужное количество участников")
+    pending_number_choice.add(user_id)
+    await NumberChoiceForm.waiting_number.set()
+    await message.answer(
+        f"Код принят ✅\n\n"
+        f"Теперь выбери свой номер от {NUMBER_MIN} до {NUMBER_MAX}."
+    )
 
 
 if __name__ == "__main__":

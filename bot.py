@@ -1,9 +1,9 @@
 import os
 import time
 import random
-import sqlite3
-import logging
 import asyncio
+import logging
+import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
 
@@ -49,14 +49,14 @@ print("БОТ ЗАПУЩЕН ✅")
 
 
 # =========================
-# ВРЕМЕННОЕ СОСТОЯНИЕ В ПАМЯТИ
+# ВРЕМЕННОЕ СОСТОЯНИЕ
 # =========================
 last_message_time = {}      # user_id -> timestamp
 wrong_code_attempts = {}    # user_id -> {"count": int, "until": timestamp}
-pending_captcha = set()     # user_id, кому показана кнопка "Я человек"
+pending_confirm = set()     # user_id, кому показана кнопка "Я человек"
 
 current_giveaway = {}
-time_task = None
+finish_job_id = None
 
 
 # =========================
@@ -75,7 +75,7 @@ class GiveawayForm(StatesGroup):
 
 
 # =========================
-# DB
+# SQLITE
 # =========================
 def get_conn():
     return sqlite3.connect(DB_PATH)
@@ -112,7 +112,7 @@ def init_db():
     """)
 
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS passed_captcha (
+        CREATE TABLE IF NOT EXISTS passed_confirm (
             user_id INTEGER PRIMARY KEY,
             giveaway_code TEXT,
             passed_at TEXT
@@ -226,10 +226,12 @@ def clear_giveaway_db():
 def add_participant(user_id: int, username: str):
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute("""
         INSERT OR IGNORE INTO participants (user_id, username, joined_at)
         VALUES (?, ?, ?)
     """, (user_id, username, datetime.now().isoformat()))
+
     conn.commit()
     conn.close()
 
@@ -237,8 +239,10 @@ def add_participant(user_id: int, username: str):
 def participant_exists(user_id: int) -> bool:
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute("SELECT 1 FROM participants WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
+
     conn.close()
     return row is not None
 
@@ -246,12 +250,14 @@ def participant_exists(user_id: int) -> bool:
 def get_participants() -> List[Tuple[int, str, str]]:
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute("""
         SELECT user_id, username, joined_at
         FROM participants
         ORDER BY joined_at ASC
     """)
     rows = cur.fetchall()
+
     conn.close()
     return rows
 
@@ -259,8 +265,10 @@ def get_participants() -> List[Tuple[int, str, str]]:
 def get_participants_count() -> int:
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute("SELECT COUNT(*) FROM participants")
     count = cur.fetchone()[0]
+
     conn.close()
     return count
 
@@ -268,38 +276,46 @@ def get_participants_count() -> int:
 def clear_participants():
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute("DELETE FROM participants")
+
     conn.commit()
     conn.close()
 
 
-def mark_captcha_passed(user_id: int, giveaway_code: str):
+def mark_confirm_passed(user_id: int, giveaway_code: str):
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute("""
-        INSERT OR REPLACE INTO passed_captcha (user_id, giveaway_code, passed_at)
+        INSERT OR REPLACE INTO passed_confirm (user_id, giveaway_code, passed_at)
         VALUES (?, ?, ?)
     """, (user_id, giveaway_code, datetime.now().isoformat()))
+
     conn.commit()
     conn.close()
 
 
-def has_passed_captcha(user_id: int, giveaway_code: str) -> bool:
+def has_passed_confirm(user_id: int, giveaway_code: str) -> bool:
     conn = get_conn()
     cur = conn.cursor()
+
     cur.execute("""
-        SELECT 1 FROM passed_captcha
+        SELECT 1 FROM passed_confirm
         WHERE user_id = ? AND giveaway_code = ?
     """, (user_id, giveaway_code))
     row = cur.fetchone()
+
     conn.close()
     return row is not None
 
 
-def clear_passed_captcha():
+def clear_passed_confirm():
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM passed_captcha")
+
+    cur.execute("DELETE FROM passed_confirm")
+
     conn.commit()
     conn.close()
 
@@ -318,6 +334,7 @@ def parse_dt(value: Optional[str]) -> Optional[datetime]:
 
 
 def build_caption(description: str) -> str:
+    # ВАЖНО: бот больше ничего не дописывает от себя
     return description
 
 
@@ -400,12 +417,7 @@ def human_check_kb() -> InlineKeyboardMarkup:
     return kb
 
 
-async def animate_winner_selection(participants: List[Tuple[int, str, str]]) -> str:
-    """
-    Визуальная имитация рандомайзера.
-    Возвращает итоговый текст победителя.
-    """
-    sample_names = [p[1] for p in participants]
+async def animate_winner_selection(participants: List[Tuple[int, str, str]]) -> int:
     msg = await bot.send_message(ADMIN_ID, "🎲 Запускаю рандомайзер...")
 
     steps = [
@@ -415,21 +427,20 @@ async def animate_winner_selection(participants: List[Tuple[int, str, str]]) -> 
     ]
 
     for step in steps:
+        await asyncio.sleep(0.8)
         await msg.edit_text(step)
 
-    if sample_names:
-        preview_pool = sample_names[:]
-        random.shuffle(preview_pool)
-        preview_names = preview_pool[:min(3, len(preview_pool))]
-        for name in preview_names:
-            await msg.edit_text(f"🎲 {name}")
+    preview_names = [p[1] for p in participants]
+    random.shuffle(preview_names)
+    preview_names = preview_names[:min(3, len(preview_names))]
+
+    for name in preview_names:
+        await asyncio.sleep(0.6)
+        await msg.edit_text(f"🎲 {name}")
 
     return msg.message_id
 
 
-# =========================
-# GIVEAWAY CORE
-# =========================
 async def post_winners_to_channel(winners_text: str):
     try:
         await bot.send_message(
@@ -440,14 +451,29 @@ async def post_winners_to_channel(winners_text: str):
         await bot.send_message(ADMIN_ID, f"Не удалось отправить победителей в канал: {e}")
 
 
+async def remove_finish_job():
+    global finish_job_id
+    if finish_job_id:
+        try:
+            scheduler.remove_job(finish_job_id)
+        except Exception:
+            pass
+        finish_job_id = None
+
+
+# =========================
+# GIVEAWAY CORE
+# =========================
 async def finish_giveaway(reason: str):
-    global current_giveaway, time_task
+    global current_giveaway
 
     if not current_giveaway.get("active"):
         return
 
     participants = get_participants()
     winners_count = current_giveaway.get("winners_count", 1) or 1
+
+    await remove_finish_job()
 
     if not participants:
         await bot.send_message(
@@ -488,31 +514,18 @@ async def finish_giveaway(reason: str):
         await post_winners_to_channel(winners_text)
 
     current_giveaway = {"active": False}
-    if time_task:
-        time_task.cancel()
-        time_task = None
-
     clear_participants()
-    clear_passed_captcha()
+    clear_passed_confirm()
     clear_giveaway_db()
-
-
-async def time_finish_worker():
-    global current_giveaway
-
-    while current_giveaway.get("active"):
-        end_dt = parse_dt(current_giveaway.get("end_datetime"))
-        if end_dt and datetime.now() >= end_dt:
-            await finish_giveaway("вышло время")
-            return
-        await asyncio.sleep(1)
+    pending_confirm.clear()
 
 
 async def start_giveaway():
-    global current_giveaway, time_task
+    global current_giveaway, finish_job_id
 
     clear_participants()
-    clear_passed_captcha()
+    clear_passed_confirm()
+    pending_confirm.clear()
 
     media_type = current_giveaway["media_type"]
     media_file_id = current_giveaway["media_file_id"]
@@ -523,37 +536,62 @@ async def start_giveaway():
     save_giveaway(current_giveaway)
 
     if media_type == "video":
-        await bot.send_video(CHANNEL_ID, media_file_id, caption=caption)
+        await bot.send_video(
+            chat_id=CHANNEL_ID,
+            video=media_file_id,
+            caption=caption
+        )
     else:
-        await bot.send_photo(CHANNEL_ID, media_file_id, caption=caption)
+        await bot.send_photo(
+            chat_id=CHANNEL_ID,
+            photo=media_file_id,
+            caption=caption
+        )
 
     await bot.send_message(ADMIN_ID, "✅ Розыгрыш запущен и опубликован в канале")
 
     if current_giveaway["end_mode"] == "time":
-        time_task = asyncio.create_task(time_finish_worker())
+        end_dt = parse_dt(current_giveaway.get("end_datetime"))
+        if end_dt:
+            finish_job_id = f"finish_{int(time.time())}"
+            scheduler.add_job(
+                finish_giveaway,
+                trigger="date",
+                run_date=end_dt,
+                args=["вышло время"],
+                id=finish_job_id,
+                replace_existing=True
+            )
 
 
 async def scheduled_start():
     await start_giveaway()
 
 
-# =========================
-# STARTUP
-# =========================
 async def restore_state():
-    global current_giveaway, time_task
+    global current_giveaway, finish_job_id
 
     current_giveaway = load_giveaway()
+
     if not current_giveaway:
         current_giveaway = {"active": False}
         return
 
     if current_giveaway.get("active") and current_giveaway.get("end_mode") == "time":
         end_dt = parse_dt(current_giveaway.get("end_datetime"))
-        if end_dt and datetime.now() < end_dt:
-            time_task = asyncio.create_task(time_finish_worker())
-        elif end_dt and datetime.now() >= end_dt:
-            await finish_giveaway("вышло время после перезапуска")
+        if end_dt:
+            if datetime.now() >= end_dt:
+                await finish_giveaway("вышло время после перезапуска")
+            else:
+                finish_job_id = "finish_restored"
+                scheduler.add_job(
+                    finish_giveaway,
+                    trigger="date",
+                    run_date=end_dt,
+                    args=["вышло время"],
+                    id=finish_job_id,
+                    replace_existing=True
+                )
 
 
 async def on_startup(_):
@@ -574,7 +612,7 @@ async def start_cmd(message: types.Message):
         "1. Подпишись на канал\n"
         "2. Найди код\n"
         "3. Отправь код сюда\n"
-        "4. Подтверди, что ты человек"
+        "4. Нажми кнопку подтверждения"
     )
 
 
@@ -614,19 +652,18 @@ async def status_cmd(message: types.Message):
 
 @dp.message_handler(commands=["cancel"])
 async def cancel_cmd(message: types.Message):
-    global current_giveaway, time_task
+    global current_giveaway
 
     if not is_admin(message.from_user.id):
         return
 
-    if time_task:
-        time_task.cancel()
-        time_task = None
+    await remove_finish_job()
 
     clear_participants()
-    clear_passed_captcha()
+    clear_passed_confirm()
     clear_giveaway_db()
     current_giveaway = {"active": False}
+    pending_confirm.clear()
 
     await message.answer("Активный розыгрыш отменён ❌")
 
@@ -687,6 +724,7 @@ async def cb_admin_list(callback: types.CallbackQuery):
         return
 
     participants = get_participants()
+
     if not participants:
         await callback.message.answer("Участников пока нет")
         await callback.answer()
@@ -705,19 +743,18 @@ async def cb_admin_list(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == "admin_cancel")
 async def cb_admin_cancel(callback: types.CallbackQuery):
-    global current_giveaway, time_task
+    global current_giveaway
 
     if not is_admin(callback.from_user.id):
         return
 
-    if time_task:
-        time_task.cancel()
-        time_task = None
+    await remove_finish_job()
 
     clear_participants()
-    clear_passed_captcha()
+    clear_passed_confirm()
     clear_giveaway_db()
     current_giveaway = {"active": False}
+    pending_confirm.clear()
 
     await callback.message.answer("Активный розыгрыш отменён ❌")
     await callback.answer()
@@ -727,13 +764,14 @@ async def cb_admin_cancel(callback: types.CallbackQuery):
 async def cb_setup_cancel(callback: types.CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
         return
+
     await state.finish()
     await callback.message.answer("Создание розыгрыша отменено ❌")
     await callback.answer()
 
 
 # =========================
-# FSM CREATE GIVEAWAY
+# СОЗДАНИЕ РОЗЫГРЫША
 # =========================
 @dp.message_handler(content_types=["video", "photo", "document"], state=GiveawayForm.waiting_media)
 async def process_media(message: types.Message, state: FSMContext):
@@ -946,14 +984,14 @@ async def process_confirm(callback: types.CallbackQuery, state: FSMContext):
 
 
 # =========================
-# CAPTCHA
+# ПОДТВЕРЖДЕНИЕ УЧАСТИЯ
 # =========================
 @dp.callback_query_handler(lambda c: c.data == "captcha_ok")
 async def captcha_callback(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     current_code = current_giveaway.get("code")
 
-    if user_id not in pending_captcha:
+    if user_id not in pending_confirm:
         await callback.answer("Подтверждение уже неактуально", show_alert=True)
         return
 
@@ -964,8 +1002,8 @@ async def captcha_callback(callback: types.CallbackQuery):
     if not participant_exists(user_id):
         add_participant(user_id, display_name)
 
-    mark_captcha_passed(user_id, current_code)
-    pending_captcha.discard(user_id)
+    mark_confirm_passed(user_id, current_code)
+    pending_confirm.discard(user_id)
     reset_wrong_code_attempts(user_id)
 
     await callback.message.edit_text("Ты подтверждён и участвуешь 🎉")
@@ -977,7 +1015,7 @@ async def captcha_callback(callback: types.CallbackQuery):
 
 
 # =========================
-# USER PARTICIPATION
+# УЧАСТИЕ ПОЛЬЗОВАТЕЛЯ
 # =========================
 @dp.message_handler()
 async def check_code(message: types.Message):
@@ -1014,7 +1052,7 @@ async def check_code(message: types.Message):
         await message.answer("Ты уже участвуешь 😉")
         return
 
-    if has_passed_captcha(user_id, current_code):
+    if has_passed_confirm(user_id, current_code):
         username = message.from_user.username
         full_name = message.from_user.full_name
         display_name = f"@{username}" if username else full_name
@@ -1023,7 +1061,7 @@ async def check_code(message: types.Message):
         await message.answer("Ты участвуешь 🎉")
         return
 
-    pending_captcha.add(user_id)
+    pending_confirm.add(user_id)
     await message.answer(
         "Подтверди, что ты человек 👇",
         reply_markup=human_check_kb()

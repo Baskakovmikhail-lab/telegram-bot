@@ -627,7 +627,7 @@ async def remove_start_job():
         start_job_id = None
 
 
-async def ask_for_number_choice(target: types.Union[types.Message, types.CallbackQuery], resend: bool = False):
+async def ask_for_number_choice(target, resend: bool = False):
     free_numbers = get_free_numbers()
 
     if not free_numbers:

@@ -354,8 +354,6 @@ def clear_passed_confirm():
 
     conn.commit()
     conn.close()
-    
-    
     # =========================
 # HELPERS
 # =========================
@@ -587,9 +585,7 @@ async def finish_giveaway(reason: str):
             winners_lines.append(f"{medal} {names[winner_id]}")
 
         winners_text = "\n".join(winners_lines)
-        
-        
-        await bot.edit_message_text(
+                await bot.edit_message_text(
             f"🏆 Победитель определён!\n\n{winners_text}",
             chat_id=ADMIN_ID,
             message_id=msg_id
@@ -796,8 +792,6 @@ async def ikota_cmd(message: types.Message):
             "/start — информация о текущем розыгрыше\n"
             "/ikota — список доступных команд"
         )
-        
-        
         @dp.message_handler(commands=["status"])
 async def status_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
@@ -1052,8 +1046,6 @@ async def cb_publish_cancel(callback: types.CallbackQuery):
 
     await callback.message.answer("Публикация отменена ❌", reply_markup=admin_menu_kb())
     await callback.answer()
-    
-    
     # =========================
 # FSM: ОСНОВНОЙ FLOW
 # =========================

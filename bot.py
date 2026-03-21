@@ -57,8 +57,8 @@ print("БОТ ЗАПУЩЕН ✅")
 # =========================
 # ВРЕМЕННОЕ СОСТОЯНИЕ
 # =========================
-last_message_time = {}   # user_id -> timestamp
-wrong_code_attempts = {} # user_id -> {"count": int, "until": timestamp}
+last_message_time = {}
+wrong_code_attempts = {}
 pending_number_choice = set()
 
 current_giveaway = {}
@@ -488,6 +488,71 @@ async def animate_winner_selection(participants: List[Tuple[int, str, str, Optio
     return msg.message_id
 
 
+async def animate_winners_in_channel(winner_rows: List[Tuple[int, str, str, Optional[int]]]):
+    try:
+        msg = await bot.send_message(CHANNEL_ID, "🎲 Определяем победителя...")
+        last_text = ""
+
+        if len(winner_rows) == 1:
+            _, winner_name, _, winner_number = winner_rows[0]
+
+            for _ in range(12):
+                fake_number = random.randint(NUMBER_MIN, NUMBER_MAX)
+                new_text = f"🎲 Определяем победителя...\n\nЧисло: {fake_number}"
+
+                if new_text == last_text:
+                    continue
+
+                await asyncio.sleep(0.35)
+                try:
+                    await msg.edit_text(new_text)
+                    last_text = new_text
+                except Exception as e:
+                    if "Message is not modified" not in str(e):
+                        raise
+
+            final_text = (
+                f"🏆 Победитель определён!\n\n"
+                f"Выигрышное число: {winner_number}\n"
+                f"Победитель: {winner_name}"
+            )
+
+            if final_text != last_text:
+                await msg.edit_text(final_text)
+            return
+
+        lines = []
+        for i, (_, name, _, num) in enumerate(winner_rows, start=1):
+            for _ in range(8):
+                fake = random.randint(NUMBER_MIN, NUMBER_MAX)
+                new_text = f"🎲 Раунд {i}/{len(winner_rows)}\nЧисло: {fake}"
+
+                if new_text == last_text:
+                    continue
+
+                await asyncio.sleep(0.25)
+                try:
+                    await msg.edit_text(new_text)
+                    last_text = new_text
+                except Exception as e:
+                    if "Message is not modified" not in str(e):
+                        raise
+
+            lines.append(f"{i}. Число: {num} — {name}")
+            round_text = "🏆 Победители определяются...\n\n" + "\n".join(lines)
+
+            if round_text != last_text:
+                await msg.edit_text(round_text)
+                last_text = round_text
+
+        final_text = "🏆 Победители определены!\n\n" + "\n".join(lines)
+        if final_text != last_text:
+            await msg.edit_text(final_text)
+
+    except Exception as e:
+        await bot.send_message(ADMIN_ID, f"Ошибка анимации: {e}")
+
+
 async def notify_winner_in_private(user_id: int, place_text: str, chosen_number: Optional[int]) -> bool:
     number_text = f"\nТвой выигравший номер: {chosen_number}" if chosen_number is not None else ""
     try:
@@ -500,58 +565,6 @@ async def notify_winner_in_private(user_id: int, place_text: str, chosen_number:
         return True
     except Exception:
         return False
-
-
-async def animate_winners_in_channel(winner_rows: List[Tuple[int, str, str, Optional[int]]]):
-    try:
-        msg = await bot.send_message(
-            CHANNEL_ID,
-            "🎲 Определяем победителя..."
-        )
-
-        if len(winner_rows) == 1:
-            _, winner_name, _, winner_number = winner_rows[0]
-
-            for _ in range(12):
-                fake_number = random.randint(NUMBER_MIN, NUMBER_MAX)
-                await asyncio.sleep(0.35)
-                await msg.edit_text(
-                    f"🎲 Определяем победителя...\n\n"
-                    f"Число: {fake_number}"
-                )
-
-            await asyncio.sleep(0.4)
-            await msg.edit_text(
-                f"🏆 Победитель определён!\n\n"
-                f"Выигрышное число: {winner_number}\n"
-                f"Победитель: {winner_name}"
-            )
-            return
-
-        lines = []
-        for index, (_, winner_name, _, winner_number) in enumerate(winner_rows, start=1):
-            for _ in range(8):
-                fake_number = random.randint(NUMBER_MIN, NUMBER_MAX)
-                await asyncio.sleep(0.25)
-                await msg.edit_text(
-                    f"🎲 Определяем победителей...\n\n"
-                    f"Раунд {index}/{len(winner_rows)}\n"
-                    f"Число: {fake_number}"
-                )
-
-            lines.append(f"{index}. Число: {winner_number} — {winner_name}")
-            await asyncio.sleep(0.35)
-            await msg.edit_text(
-                "🏆 Победители определяются...\n\n" + "\n".join(lines)
-            )
-
-        await asyncio.sleep(0.4)
-        await msg.edit_text(
-            "🏆 Победители определены!\n\n" + "\n".join(lines)
-        )
-
-    except Exception as e:
-        await bot.send_message(ADMIN_ID, f"Не удалось показать анимацию победителя в канал: {e}")
 
 
 async def remove_finish_job():
@@ -591,9 +604,9 @@ async def finish_giveaway(reason: str):
     if not participants:
         await bot.send_message(
             ADMIN_ID,
-            f"Розыгрыш завершён ({reason}), но участников нет ❌"
+            f"Розыгрыш завершён ({reason}), но участников нет ❌",
+            reply_markup=admin_menu_kb()
         )
-        await post_winners_to_channel("Участников не было.", 0)
     else:
         msg_id = await animate_winner_selection(participants)
 
@@ -726,13 +739,10 @@ async def restore_state():
 
 
 async def on_startup(_):
-    # убираем возможный webhook (фикс ошибки двойного запуска)
     await bot.delete_webhook(drop_pending_updates=True)
-
     init_db()
     scheduler.start()
     await restore_state()
-
     await bot.send_message(
         ADMIN_ID,
         "Бот запущен ✅\n\nВыбери действие:",
@@ -797,7 +807,7 @@ async def start_cmd(message: types.Message):
         "1. Подпишись на канал\n"
         "2. Найди код\n"
         "3. Отправь код сюда\n"
-        f"4. Выбери номер от {NUMBER_MIN} до {NUMBER_MAX}"
+        f"4. Выбери свой номер от {NUMBER_MIN} до {NUMBER_MAX}"
     )
 
 

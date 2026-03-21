@@ -794,7 +794,7 @@ async def ikota_cmd(message: types.Message):
             "/start — информация о текущем розыгрыше\n"
             "/ikota — список доступных команд"
         )
-        @dp.message_handler(commands=["status"])
+@dp.message_handler(commands=["status"])
 async def status_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return
@@ -828,7 +828,6 @@ async def status_cmd(message: types.Message):
         text += f"До: {format_dt(parse_dt(current_giveaway.get('end_datetime')))}\n{TIMEZONE_TEXT}"
 
     await message.answer(text)
-
 
 # =========================
 # ADMIN CALLBACKS

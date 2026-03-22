@@ -683,7 +683,7 @@ def build_status_text() -> str:
         total_needed = current_giveaway.get("end_value", 0) or 0
         current_count = get_participants_count()
         left = max(total_needed - current_count, 0)
-        return f"👥 Осталось мест: {left}\nУчастников: {current_count}/{total_needed}"
+        return f"👥 Осталось мест: {left}"
 
     if current_giveaway.get("start_mode") == "scheduled" and current_giveaway.get("start_datetime"):
         return f"⏳ До старта розыгрыша: {format_remaining_time(parse_dt(current_giveaway.get('start_datetime')))}"
@@ -895,8 +895,11 @@ async def restore_state():
         return
 
     if current_giveaway.get("start_mode") == "scheduled" and current_giveaway.get("start_datetime"):
+        if not current_giveaway.get("status_message_id"):
+            await publish_status_message()
+        else:
+            await update_status_message()
         await start_status_updates()
-        await update_status_message()
 
         start_dt = parse_dt(current_giveaway.get("start_datetime"))
         if start_dt:
@@ -1265,8 +1268,12 @@ async def cb_publish_now(callback: types.CallbackQuery):
 
         start_dt = parse_dt(current_giveaway["start_datetime"])
 
-        if not current_giveaway.get("post_message_id"):
-            await publish_giveaway_post()
+        if not current_giveaway.get("status_message_id"):
+            await publish_status_message()
+        else:
+            await update_status_message()
+
+        await start_status_updates()
 
         start_job_id = f"start_{int(time.time())}"
 

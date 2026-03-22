@@ -43,7 +43,6 @@ WRONG_CODE_BLOCK_MINUTES = 10
 
 NUMBER_MIN = 1
 NUMBER_MAX = 100
-NUMBER_BUTTONS_COUNT = 3
 
 logging.basicConfig(level=logging.INFO)
 
@@ -466,13 +465,10 @@ def publish_preview_kb() -> InlineKeyboardMarkup:
 
 def choose_number_kb() -> InlineKeyboardMarkup:
     free_numbers = get_free_numbers()
-    kb = InlineKeyboardMarkup(row_width=3)
+    kb = InlineKeyboardMarkup(row_width=1)
 
     if free_numbers:
-        picks = random.sample(free_numbers, min(NUMBER_BUTTONS_COUNT, len(free_numbers)))
-        buttons = [InlineKeyboardButton(str(num), callback_data=f"picknum_{num}") for num in picks]
-        kb.add(*buttons)
-        kb.add(InlineKeyboardButton("🎲 Дай случайный номер", callback_data="picknum_random"))
+        kb.add(InlineKeyboardButton("🎲 Случайный номер", callback_data="picknum_random"))
 
     return kb
 
@@ -638,19 +634,13 @@ async def ask_for_number_choice(target, resend: bool = False):
             await target.answer(text)
         return
 
-    if len(free_numbers) <= 10:
-        free_hint = ", ".join(map(str, free_numbers))
-        base_text = (
-            f"Код принят ✅\n\n"
-            f"Выбери свой номер от {NUMBER_MIN} до {NUMBER_MAX}.\n"
-            f"Свободные числа:\n{free_hint}"
-        )
-    else:
-        base_text = (
-            f"{'Выбери другой номер.' if resend else 'Код принят ✅'}\n\n"
-            f"Выбери свой номер от {NUMBER_MIN} до {NUMBER_MAX}\n"
-            f"или нажми «🎲 Дай случайный номер»."
-        )
+    prefix = "⚠️ Выбери другой номер.\n\n" if resend else "Код принят ✅\n\n"
+    base_text = (
+        f"{prefix}"
+        f"🎯 Выбери свой счастливый номер от {NUMBER_MIN} до {NUMBER_MAX}\n"
+        f"✍️ Напиши число в чат\n"
+        f"🎲 Или нажми «Случайный номер»"
+    )
 
     if isinstance(target, types.CallbackQuery):
         await target.message.answer(base_text, reply_markup=choose_number_kb())
@@ -878,7 +868,9 @@ async def start_cmd(message: types.Message):
         "1. Подпишись на канал\n"
         "2. Найди код\n"
         "3. Отправь код сюда\n"
-        f"4. Выбери свой номер от {NUMBER_MIN} до {NUMBER_MAX}"
+        f"4. Выбери свой счастливый номер от {NUMBER_MIN} до {NUMBER_MAX}\n\n"
+        "✍️ Напиши число в чат\n"
+        "🎲 Или нажми «Случайный номер»"
     )
 
 
@@ -1187,7 +1179,7 @@ async def cb_publish_cancel(callback: types.CallbackQuery):
 
 
 # =========================
-# ВЫБОР НОМЕРА ЧЕРЕЗ КНОПКИ
+# ВЫБОР НОМЕРА ЧЕРЕЗ КНОПКУ СЛУЧАЙНОГО ВЫБОРА
 # =========================
 @dp.callback_query_handler(lambda c: c.data.startswith("picknum_"), state=NumberChoiceForm.waiting_number)
 async def cb_pick_number(callback: types.CallbackQuery, state: FSMContext):
@@ -1575,15 +1567,15 @@ async def process_personal_number(message: types.Message, state: FSMContext):
         chosen_number = int((message.text or "").strip())
     except ValueError:
         await message.answer(
-            f"Отправь число от {NUMBER_MIN} до {NUMBER_MAX} "
-            f"или нажми одну из кнопок ниже.",
+            f"❌ Напиши число от {NUMBER_MIN} до {NUMBER_MAX}\n"
+            f"🎲 Или нажми «Случайный номер»",
             reply_markup=choose_number_kb()
         )
         return
 
     if chosen_number < NUMBER_MIN or chosen_number > NUMBER_MAX:
         await message.answer(
-            f"Номер должен быть от {NUMBER_MIN} до {NUMBER_MAX}.",
+            f"❌ Можно выбрать число только от {NUMBER_MIN} до {NUMBER_MAX}",
             reply_markup=choose_number_kb()
         )
         return
@@ -1600,16 +1592,16 @@ async def process_personal_number(message: types.Message, state: FSMContext):
         if len(free_numbers) <= 10:
             hint = ", ".join(map(str, free_numbers))
             await message.answer(
-                f"Номер {chosen_number} уже занят ❌\n\n"
-                f"Свободные числа:\n{hint}",
+                f"⚠️ Номер {chosen_number} уже занят\n\n"
+                f"Свободные числа:\n{hint}\n\n"
+                f"🎲 Или нажми «Случайный номер»",
                 reply_markup=choose_number_kb()
             )
         else:
-            sample = random.sample(free_numbers, min(5, len(free_numbers)))
-            hint = ", ".join(map(str, sample))
             await message.answer(
-                f"Номер {chosen_number} уже занят ❌\n\n"
-                f"Попробуй одно из этих:\n{hint}",
+                f"⚠️ Номер {chosen_number} уже занят\n"
+                f"✍️ Напиши другой номер\n"
+                f"🎲 Или нажми «Случайный номер»",
                 reply_markup=choose_number_kb()
             )
         return

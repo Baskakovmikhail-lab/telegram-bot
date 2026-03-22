@@ -380,6 +380,12 @@ def get_current_number_max() -> int:
     return DEFAULT_NUMBER_MAX
 
 
+def get_numbers_info_text() -> str:
+    if current_giveaway.get("end_mode") == "time":
+        return "автоназначение по 100"
+    return f"{NUMBER_MIN}–{get_current_number_max()}"
+
+
 def get_free_numbers() -> List[int]:
     conn = get_conn()
     cur = conn.cursor()
@@ -852,6 +858,49 @@ async def remove_start_job():
         start_job_id = None
 
 
+def get_time_mode_block_range(participant_index: int) -> Tuple[int, int]:
+    block_index = (participant_index - 1) // 100
+    start = block_index * 100 + 1
+    end = start + 99
+    return start, end
+
+
+def get_taken_numbers_in_range(start: int, end: int) -> set:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT chosen_number
+        FROM participants
+        WHERE chosen_number BETWEEN ? AND ?
+        """,
+        (start, end)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return {row[0] for row in rows if row[0] is not None}
+
+
+async def assign_time_mode_number(user_id: int, display_name: str) -> Optional[int]:
+    for _ in range(10):
+        participant_index = get_participants_count() + 1
+        start, end = get_time_mode_block_range(participant_index)
+        taken = get_taken_numbers_in_range(start, end)
+        free_numbers = [n for n in range(start, end + 1) if n not in taken]
+
+        if not free_numbers:
+            continue
+
+        chosen_number = random.choice(free_numbers)
+        ok = add_participant(user_id, display_name, chosen_number)
+        if ok:
+            return chosen_number
+
+        await asyncio.sleep(0.05)
+
+    return None
+
+
 async def ask_for_number_choice(target, resend: bool = False):
     free_numbers = get_free_numbers()
     max_number = get_current_number_max()
@@ -922,6 +971,9 @@ async def finish_giveaway(reason: str):
 
         winners_text = "\n".join(winners_lines)
 
+        await animate_winners_in_channel(winner_rows)
+        await asyncio.sleep(1)
+
         notify_lines = []
         for i, (winner_id, winner_name, _, chosen_number) in enumerate(winner_rows, start=1):
             place_text = "победитель" if i == 1 else f"в числе победителей (место {i})"
@@ -946,8 +998,6 @@ async def finish_giveaway(reason: str):
             f"Личные сообщения:\n{notify_text}",
             reply_markup=admin_menu_kb()
         )
-
-        await animate_winners_in_channel(winner_rows)
 
     current_giveaway = {"active": False}
     clear_participants()
@@ -1118,6 +1168,19 @@ async def start_cmd(message: types.Message):
         )
         return
 
+    if current_giveaway.get("end_mode") == "time":
+        await message.answer(
+            "Привет 👋\n\n"
+            "Чтобы участвовать:\n"
+            "1. Подпишись на канал\n"
+            "2. Найди код\n"
+            "3. Отправь код сюда\n\n"
+            "🎯 Номер бот назначит автоматически\n"
+            "Первые 100 участников получают случайные номера от 1 до 100,\n"
+            "следующие 100 — от 101 до 200 и так далее."
+        )
+        return
+
     max_number = get_current_number_max()
 
     await message.answer(
@@ -1173,7 +1236,7 @@ async def status_cmd(message: types.Message):
                 f"Старт: {format_dt(parse_dt(current_giveaway.get('start_datetime')))}\n"
                 f"Завершение: {finish_text}\n"
                 f"Победителей: {current_giveaway.get('winners_count')}\n"
-                f"Номера: {NUMBER_MIN}–{max_number}\n"
+                f"Номера: {get_numbers_info_text()}\n"
                 f"{TIMEZONE_TEXT}",
                 reply_markup=admin_menu_kb()
             )
@@ -1187,7 +1250,7 @@ async def status_cmd(message: types.Message):
         f"Код: {current_giveaway.get('code')}\n"
         f"Участников: {get_participants_count()}\n"
         f"Победителей: {current_giveaway.get('winners_count')}\n"
-        f"Номера: {NUMBER_MIN}–{max_number}\n"
+        f"Номера: {get_numbers_info_text()}\n"
     )
 
     if current_giveaway.get("end_mode") == "count":
@@ -1238,7 +1301,7 @@ async def cb_admin_active(callback: types.CallbackQuery):
                 f"Код: {current_giveaway.get('code')}\n"
                 f"Старт: {format_dt(parse_dt(current_giveaway.get('start_datetime')))}\n"
                 f"Победителей: {current_giveaway.get('winners_count')}\n"
-                f"Номера: {NUMBER_MIN}–{max_number}\n"
+                f"Номера: {get_numbers_info_text()}\n"
             )
 
             if current_giveaway.get("end_mode") == "count":
@@ -1264,7 +1327,7 @@ async def cb_admin_active(callback: types.CallbackQuery):
         f"Код: {current_giveaway.get('code')}\n"
         f"Участников: {get_participants_count()}\n"
         f"Победителей: {current_giveaway.get('winners_count')}\n"
-        f"Номера: {NUMBER_MIN}–{max_number}\n"
+        f"Номера: {get_numbers_info_text()}\n"
     )
 
     if current_giveaway.get("end_mode") == "count":
@@ -1312,7 +1375,7 @@ async def cb_admin_status(callback: types.CallbackQuery):
                 f"Старт: {format_dt(parse_dt(current_giveaway.get('start_datetime')))}\n"
                 f"Завершение: {finish_text}\n"
                 f"Победителей: {current_giveaway.get('winners_count')}\n"
-                f"Номера: {NUMBER_MIN}–{max_number}\n"
+                f"Номера: {get_numbers_info_text()}\n"
                 f"{TIMEZONE_TEXT}"
             )
             await callback.answer()
@@ -1327,7 +1390,7 @@ async def cb_admin_status(callback: types.CallbackQuery):
         f"Код: {current_giveaway.get('code')}\n"
         f"Участников: {get_participants_count()}\n"
         f"Победителей: {current_giveaway.get('winners_count')}\n"
-        f"Номера: {NUMBER_MIN}–{max_number}\n"
+        f"Номера: {get_numbers_info_text()}\n"
     )
 
     if current_giveaway.get("end_mode") == "count":
@@ -1960,6 +2023,25 @@ async def check_code(message: types.Message):
         chosen_number = get_participant_number(user_id)
         number_text = f"\nТвой номер: {chosen_number}" if chosen_number is not None else ""
         await message.answer(f"Ты уже участвуешь в этом розыгрыше 🎉{number_text}")
+        return
+
+    username = message.from_user.username
+    full_name = message.from_user.full_name
+    display_name = f"@{username}" if username else full_name
+
+    if current_giveaway.get("end_mode") == "time":
+        chosen_number = await assign_time_mode_number(user_id, display_name)
+        if chosen_number is None:
+            await message.answer("Не удалось назначить номер 😕 Попробуй ещё раз.")
+            return
+
+        reset_wrong_code_attempts(user_id)
+        await message.answer(
+            "Код принят ✅\n\n"
+            "🎯 Ты участвуешь в розыгрыше\n"
+            f"Твой номер: {chosen_number}"
+        )
+        await update_status_message()
         return
 
     pending_number_choice.add(user_id)

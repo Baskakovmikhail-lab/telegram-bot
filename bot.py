@@ -649,8 +649,10 @@ def build_status_text() -> str:
                 return "⏳ Финал близко\n\n🎯 Готовься"
             elif seconds_left > 10:
                 return "⏳ Последние секунды\n\n⚡ Прямо сейчас"
-            else:
+            elif seconds_left > 3:
                 return f"⏳ До финала: {seconds_left}с\n\n🎲 Выбираем..."
+            else:
+                return "🎲 Выбираем..."
 
         # ===== COUNT MODE =====
         total_needed = current_giveaway.get("end_value", 0) or 0
@@ -708,9 +710,9 @@ async def update_status_message():
                 seconds_left = int((end_dt - now_utc3()).total_seconds())
 
                 desired_interval = 5
-                if 0 < seconds_left <= 10:
+                if 3 < seconds_left <= 10:
                     desired_interval = 1
-                elif 0 < seconds_left <= 60:
+                elif 10 < seconds_left <= 60:
                     desired_interval = 2
 
                 job = scheduler.get_job(STATUS_JOB_ID)
@@ -733,9 +735,9 @@ async def start_status_updates():
         end_dt = parse_dt(current_giveaway.get("end_datetime"))
         if end_dt:
             seconds_left = int((end_dt - now_utc3()).total_seconds())
-            if 0 < seconds_left <= 10:
+            if 3 < seconds_left <= 10:
                 interval_seconds = 1
-            elif 0 < seconds_left <= 60:
+            elif 10 < seconds_left <= 60:
                 interval_seconds = 2
 
     scheduler.add_job(
@@ -781,31 +783,35 @@ async def publish_active_status_under_post():
 
 # ===== FINAL ANIMATION =====
 async def animate_winners_in_channel(winner_rows):
-    msg = await bot.send_message(CHANNEL_ID, "🎲 Запускаем выбор...")
+    message_id = current_giveaway.get("status_message_id")
+
+    if not message_id:
+        await publish_status_message()
+        message_id = current_giveaway.get("status_message_id")
 
     # phase 1
     for _ in range(3):
         for dots in [".", "..", "..."]:
             await asyncio.sleep(0.25)
-            await safe_edit_message(CHANNEL_ID, msg.message_id, f"🎲 Выбираем{dots}")
+            await safe_edit_message(CHANNEL_ID, message_id, f"🎲 Выбираем{dots}")
 
     # phase 2
     for _ in range(2):
         for dots in [".", "..", "..."]:
             await asyncio.sleep(0.25)
-            await safe_edit_message(CHANNEL_ID, msg.message_id, f"⚡ Идёт выбор{dots}")
+            await safe_edit_message(CHANNEL_ID, message_id, f"⚡ Идёт выбор{dots}")
 
     # fake pause
     await asyncio.sleep(0.6)
-    await safe_edit_message(CHANNEL_ID, msg.message_id, "👀 Почти...")
+    await safe_edit_message(CHANNEL_ID, message_id, "👀 Почти...")
     await asyncio.sleep(0.7)
-    await safe_edit_message(CHANNEL_ID, msg.message_id, "👀 Почти выбрали...")
+    await safe_edit_message(CHANNEL_ID, message_id, "👀 Почти выбрали...")
     await asyncio.sleep(0.7)
 
     # final hit
-    await safe_edit_message(CHANNEL_ID, msg.message_id, "🎯 Финальный выбор...")
+    await safe_edit_message(CHANNEL_ID, message_id, "🎯 Финальный выбор...")
     await asyncio.sleep(0.5)
-    await safe_edit_message(CHANNEL_ID, msg.message_id, "...")
+    await safe_edit_message(CHANNEL_ID, message_id, "...")
     await asyncio.sleep(0.4)
 
     # result
@@ -813,7 +819,7 @@ async def animate_winners_in_channel(winner_rows):
         _, name, _, num = winner_rows[0]
         await safe_edit_message(
             CHANNEL_ID,
-            msg.message_id,
+            message_id,
             f"🏆 Победитель определён!\n\n{name}\n🎯 Номер: {num}"
         )
     else:
@@ -821,7 +827,7 @@ async def animate_winners_in_channel(winner_rows):
         for i, (_, name, _, num) in enumerate(winner_rows, start=1):
             lines.append(f"{i}. {name} — №{num}")
 
-        await safe_edit_message(CHANNEL_ID, msg.message_id, "🏆 Победители:\n\n" + "\n".join(lines))
+        await safe_edit_message(CHANNEL_ID, message_id, "🏆 Победители:\n\n" + "\n".join(lines))
 
 
 async def notify_winner_in_private(user_id: int, place_text: str, chosen_number: Optional[int]) -> bool:

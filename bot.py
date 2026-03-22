@@ -486,7 +486,6 @@ def admin_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
     kb.add(
         InlineKeyboardButton("🎁 Новый розыгрыш", callback_data="admin_new"),
-        InlineKeyboardButton("🔥 Активный розыгрыш", callback_data="admin_active"),
         InlineKeyboardButton("📊 Статус", callback_data="admin_status"),
         InlineKeyboardButton("🧾 Список участников", callback_data="admin_list"),
         InlineKeyboardButton("❌ Отменить розыгрыш", callback_data="admin_cancel"),
@@ -636,23 +635,18 @@ def build_status_text() -> str:
             seconds_left = int((end_dt - now_utc3()).total_seconds())
 
             if seconds_left <= 0:
-                return "🎲 Выбираем победителя..."
+                return "🎲 Определяем победителя..."
 
             if seconds_left > 60:
                 return f"⏳ До конца розыгрыша: {format_remaining_time(end_dt)}"
 
-            if seconds_left > 40:
-                return "⏳ Меньше минуты\n\n👀 Не моргай..."
-            elif seconds_left > 25:
-                return "⏳ Уже почти\n\n🔥 Сейчас решится всё"
-            elif seconds_left > 15:
-                return "⏳ Финал близко\n\n🎯 Готовься"
-            elif seconds_left > 10:
-                return "⏳ Последние секунды\n\n⚡ Прямо сейчас"
-            elif seconds_left > 3:
-                return f"⏳ До финала: {seconds_left}с\n\n🎲 Выбираем..."
-            else:
-                return "🎲 Выбираем..."
+            if seconds_left > 5:
+                checkpoint = (seconds_left // 5) * 5
+                if checkpoint >= 60:
+                    checkpoint = 55
+                return f"⏳ До финала: {checkpoint}с\n\n🎲 Идёт выбор..."
+
+            return f"⏳ До финала: {seconds_left}с\n\n🎲 Идёт выбор..."
 
         total_needed = current_giveaway.get("end_value", 0) or 0
         current_count = get_participants_count()
@@ -680,7 +674,7 @@ def build_status_text() -> str:
         if seconds_left <= 0:
             return "🚀 Розыгрыш запускается..."
 
-        return f"⏳ До старта розыгрыша: {format_remaining_time(start_dt)}"
+        return f"⏳ До старта нового розыгрыша: {format_remaining_time(start_dt)}"
 
     return "ℹ️ Розыгрыш не активен"
 
@@ -706,10 +700,10 @@ async def update_status_message():
                 seconds_left = int((end_dt - now_utc3()).total_seconds())
 
                 desired_interval = 5
-                if 3 < seconds_left <= 10:
+                if 0 < seconds_left <= 5:
                     desired_interval = 1
-                elif 10 < seconds_left <= 60:
-                    desired_interval = 2
+                elif 5 < seconds_left <= 60:
+                    desired_interval = 5
 
                 job = scheduler.get_job(STATUS_JOB_ID)
                 if job:
@@ -731,10 +725,10 @@ async def start_status_updates():
         end_dt = parse_dt(current_giveaway.get("end_datetime"))
         if end_dt:
             seconds_left = int((end_dt - now_utc3()).total_seconds())
-            if 3 < seconds_left <= 10:
+            if 0 < seconds_left <= 5:
                 interval_seconds = 1
-            elif 10 < seconds_left <= 60:
-                interval_seconds = 2
+            elif 5 < seconds_left <= 60:
+                interval_seconds = 5
 
     scheduler.add_job(
         update_status_message,
@@ -784,40 +778,39 @@ async def animate_winners_in_channel(winner_rows):
         await publish_status_message()
         message_id = current_giveaway.get("status_message_id")
 
-    for _ in range(3):
-        for dots in [".", "..", "..."]:
-            await asyncio.sleep(0.25)
-            await safe_edit_message(CHANNEL_ID, message_id, f"🎲 Выбираем{dots}")
+    intro_steps = [
+        "🎲 Проверяем последние данные...",
+        "⚡ Финальный выбор запущен...",
+        "👀 Напряжение растёт...",
+        "🎯 Определяем победителя..."
+    ]
 
-    for _ in range(2):
-        for dots in [".", "..", "..."]:
-            await asyncio.sleep(0.25)
-            await safe_edit_message(CHANNEL_ID, message_id, f"⚡ Идёт выбор{dots}")
+    for step in intro_steps:
+        await safe_edit_message(CHANNEL_ID, message_id, step)
+        await asyncio.sleep(0.7)
 
-    await asyncio.sleep(0.6)
-    await safe_edit_message(CHANNEL_ID, message_id, "👀 Почти...")
-    await asyncio.sleep(0.7)
-    await safe_edit_message(CHANNEL_ID, message_id, "👀 Почти выбрали...")
-    await asyncio.sleep(0.7)
-
-    await safe_edit_message(CHANNEL_ID, message_id, "🎯 Финальный выбор...")
-    await asyncio.sleep(0.5)
-    await safe_edit_message(CHANNEL_ID, message_id, "...")
-    await asyncio.sleep(0.4)
+    await safe_edit_message(CHANNEL_ID, message_id, "🥁 Барабанная дробь...")
+    await asyncio.sleep(0.9)
+    await safe_edit_message(CHANNEL_ID, message_id, "✨ И у нас есть результат...")
+    await asyncio.sleep(0.9)
 
     if len(winner_rows) == 1:
         _, name, _, num = winner_rows[0]
         await safe_edit_message(
             CHANNEL_ID,
             message_id,
-            f"🏆 Победитель определён!\n\n{name}\n🎯 Номер: {num}"
+            f"🎉 ПОБЕДИТЕЛЬ ОПРЕДЕЛЁН!\n\n🏆 {name}\n🎯 Номер: {num}"
         )
     else:
         lines = []
         for i, (_, name, _, num) in enumerate(winner_rows, start=1):
             lines.append(f"{i}. {name} — №{num}")
 
-        await safe_edit_message(CHANNEL_ID, message_id, "🏆 Победители:\n\n" + "\n".join(lines))
+        await safe_edit_message(
+            CHANNEL_ID,
+            message_id,
+            "🎉 ПОБЕДИТЕЛИ ОПРЕДЕЛЕНЫ!\n\n🏆 Итоги розыгрыша:\n" + "\n".join(lines)
+        )
 
 
 async def notify_winner_in_private(user_id: int, place_text: str, chosen_number: Optional[int]) -> bool:

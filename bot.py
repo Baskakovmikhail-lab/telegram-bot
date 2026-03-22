@@ -519,71 +519,52 @@ async def animate_winner_selection(participants: List[Tuple[int, str, str, Optio
 
 async def animate_winners_in_channel(winner_rows: List[Tuple[int, str, str, Optional[int]]]):
     try:
+        participants = get_participants()
+
+        if not participants:
+            return
+
         msg = await bot.send_message(CHANNEL_ID, "🎲 Определяем победителя...")
-        last_text = ""
+
+        names = []
+        for _, username, _, _ in participants:
+            names.append(username)
+
+        random.shuffle(names)
+
+        spins = min(10, len(names))
+        delay = 0.1
+
+        for i in range(spins):
+            name = names[i % len(names)]
+
+            try:
+                await msg.edit_text(f"🎲 Определяем победителя...\n\n{name}")
+            except Exception as e:
+                if "Message is not modified" not in str(e):
+                    raise
+
+            await asyncio.sleep(delay)
+            delay += 0.05
+
+        await asyncio.sleep(0.3)
 
         if len(winner_rows) == 1:
             _, winner_name, _, winner_number = winner_rows[0]
-            speeds = [0.08, 0.08, 0.1, 0.12, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5]
 
-            for delay in speeds:
-                fake_number = random.randint(NUMBER_MIN, NUMBER_MAX)
-                new_text = f"🎲 Определяем победителя...\n\nЧисло: {fake_number}"
-
-                if new_text == last_text:
-                    continue
-
-                await asyncio.sleep(delay)
-                try:
-                    await msg.edit_text(new_text)
-                    last_text = new_text
-                except Exception as e:
-                    if "Message is not modified" not in str(e):
-                        raise
-
-            await asyncio.sleep(0.7)
-
-            final_text = (
+            await msg.edit_text(
                 f"🏆 Победитель определён!\n\n"
-                f"Выигрышное число: {winner_number}\n"
-                f"Победитель: {winner_name}"
+                f"{winner_name}\n"
+                f"🎯 Номер: {winner_number}"
             )
+        else:
+            lines = []
+            for i, (_, name, _, num) in enumerate(winner_rows, start=1):
+                lines.append(f"{i}. {name} — №{num}")
 
-            if final_text != last_text:
-                await msg.edit_text(final_text)
-            return
-
-        lines = []
-        for i, (_, name, _, num) in enumerate(winner_rows, start=1):
-            speeds = [0.08, 0.1, 0.12, 0.16, 0.22, 0.3, 0.4]
-
-            for delay in speeds:
-                fake = random.randint(NUMBER_MIN, NUMBER_MAX)
-                new_text = f"🎲 Раунд {i}/{len(winner_rows)}\nЧисло: {fake}"
-
-                if new_text == last_text:
-                    continue
-
-                await asyncio.sleep(delay)
-                try:
-                    await msg.edit_text(new_text)
-                    last_text = new_text
-                except Exception as e:
-                    if "Message is not modified" not in str(e):
-                        raise
-
-            lines.append(f"{i}. Число: {num} — {name}")
-            round_text = "🏆 Победители определяются...\n\n" + "\n".join(lines)
-
-            if round_text != last_text:
-                await msg.edit_text(round_text)
-                last_text = round_text
-
-        await asyncio.sleep(0.7)
-
-        final_text = "🏆 Победители определены!\n\n" + "\n".join(lines)
-        if final_text != last_text:
-            await msg.edit_text(final_text)
+            await msg.edit_text(
+                "🏆 Победители:\n\n" + "\n".join(lines)
+            )
 
     except Exception as e:
         await bot.send_message(ADMIN_ID, f"Ошибка анимации: {e}")

@@ -554,21 +554,21 @@ async def send_step_hint_cb(callback: types.CallbackQuery, text: str):
     )
 
 
-async def safe_edit_message(chat_id: str, message_id: int, text: str):
+async def safe_edit_message(chat_id: str, message_id: int, text: str) -> bool:
     if not message_id:
-        return
+        return False
 
     for _ in range(3):
         try:
             await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text)
-            return
+            return True
         except MessageNotModified:
-            return
+            return True
         except RetryAfter as e:
             await asyncio.sleep(float(e.timeout) + 0.5)
         except Exception as e:
             if "message is not modified" in str(e).lower():
-                return
+                return True
             if "retry in" in str(e).lower():
                 wait_seconds = 2
                 try:
@@ -579,8 +579,10 @@ async def safe_edit_message(chat_id: str, message_id: int, text: str):
                     pass
                 await asyncio.sleep(wait_seconds + 0.5)
             else:
-                logger.warning("Не удалось отредактировать сообщение: %s", e)
-                return
+                logger.warning("Не удалось отредактировать сообщение %s в %s: %s", message_id, chat_id, e)
+                return False
+
+    return False
 
 
 async def safe_delete_message(chat_id: str, message_id: Optional[int]):
@@ -657,6 +659,8 @@ def build_status_text() -> str:
         seconds_left = int((start_dt - now_utc3()).total_seconds())
         if seconds_left <= 0:
             return "🚀 Розыгрыш запускается..."
+        if seconds_left <= 60:
+            return "⏳ Начало нового розыгрыша менее чем через минуту…"
         if seconds_left > 600:
             return f"📅 Начало нового розыгрыша: {format_dt(start_dt)}"
         return f"⏳ Начало нового розыгрыша через {format_remaining_time(start_dt)}"
@@ -676,7 +680,12 @@ async def update_status_message():
         status_message_id = current_giveaway.get("status_message_id")
         if not status_message_id:
             return
-        await safe_edit_message(CHANNEL_ID, status_message_id, build_status_text())
+
+        edited = await safe_edit_message(CHANNEL_ID, status_message_id, build_status_text())
+        if not edited:
+            msg = await bot.send_message(CHANNEL_ID, build_status_text())
+            current_giveaway["status_message_id"] = msg.message_id
+            save_giveaway(current_giveaway)
 
 
 async def start_status_updates():
@@ -889,12 +898,20 @@ async def finish_giveaway(reason: str):
         await stop_status_updates()
 
         if not participants:
+            empty_text = "🏁 Розыгрыш завершён\n\nУчастников нет ❌"
+            edited = False
+
             if current_giveaway.get("status_message_id"):
-                await safe_edit_message(
+                edited = await safe_edit_message(
                     CHANNEL_ID,
                     current_giveaway["status_message_id"],
-                    "🏁 Розыгрыш завершён\n\nУчастников нет ❌",
+                    empty_text,
                 )
+
+            if not edited:
+                msg = await bot.send_message(CHANNEL_ID, empty_text)
+                current_giveaway["status_message_id"] = msg.message_id
+                save_giveaway(current_giveaway)
 
             await notify_admin(
                 f"Розыгрыш завершён ({reason}), но участников нет ❌",
@@ -924,10 +941,18 @@ async def finish_giveaway(reason: str):
             else:
                 result_text = f"🎉 ПОБЕДИТЕЛИ ОПРЕДЕЛЕНЫ!\n\n🏆 Итоги розыгрыша:\n{winners_text}"
 
+            edited = False
             if current_giveaway.get("status_message_id"):
-                await safe_edit_message(CHANNEL_ID, current_giveaway["status_message_id"], result_text)
-            else:
-                await bot.send_message(CHANNEL_ID, result_text)
+                edited = await safe_edit_message(
+                    CHANNEL_ID,
+                    current_giveaway["status_message_id"],
+                    result_text,
+                )
+
+            if not edited:
+                msg = await bot.send_message(CHANNEL_ID, result_text)
+                current_giveaway["status_message_id"] = msg.message_id
+                save_giveaway(current_giveaway)
 
             notify_lines = []
             for i, (winner_id, winner_name, _, chosen_number) in enumerate(winner_rows, start=1):
@@ -1396,8 +1421,6 @@ async def cb_publish_now(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == "publish_cancel")
 async def cb_publish_cancel(callback: types.CallbackQuery):
-    global current_giveaway
-
     if not is_admin(callback.from_user.id):
         return
 

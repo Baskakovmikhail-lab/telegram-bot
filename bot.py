@@ -143,28 +143,19 @@ def format_remaining_time(target_dt: Optional[datetime]) -> str:
     if total_seconds <= 0:
         return "меньше минуты"
 
-    days = total_seconds // 86400
-    remainder = total_seconds % 86400
-    hours = remainder // 3600
-    remainder = remainder % 3600
+    if total_seconds < 60:
+        return f"{total_seconds}с"
 
-    parts = []
+    total_minutes = total_seconds // 60
+    hours_total = total_minutes // 60
+    minutes = total_minutes % 60
 
-    if days > 0:
-        parts.append(f"{days}д")
-
-    if hours > 0:
-        parts.append(f"{hours}ч")
-        minutes = remainder // 60
+    if hours_total > 0:
         if minutes > 0:
-            parts.append(f"{minutes}м")
-        return " ".join(parts)
+            return f"{hours_total}ч {minutes}м"
+        return f"{hours_total}ч"
 
-    if total_seconds >= 60:
-        minutes_up = (total_seconds + 59) // 60
-        return f"{minutes_up}м"
-
-    return f"{total_seconds}с"
+    return f"{total_minutes}м"
 
 
 # =========================
@@ -631,23 +622,10 @@ def build_status_text() -> str:
         seconds_left = int((end_dt - now_utc3()).total_seconds())
         if seconds_left <= 0:
             return "🎉 Розыгрыш завершён!"
-
+        if seconds_left == 5:
+            return "⏳ Ещё 5 секунд…"
         if seconds_left <= 60:
-            if seconds_left > 50:
-                return "⏳ Менее одной минуты"
-            if seconds_left > 40:
-                return "⏳ Менее 50 секунд"
-            if seconds_left > 30:
-                return "⏳ Менее 40 секунд"
-            if seconds_left > 20:
-                return "⏳ Менее 30 секунд"
-            if seconds_left > 10:
-                return "⏳ Менее 20 секунд"
-            if seconds_left > 5:
-                return "⏳ Менее 10 секунд"
-            if seconds_left == 5:
-                return "⏳ Менее 5 секунд"
-            return f"⏳ {seconds_left} сек"
+            return "⏳ Менее одной минуты"
 
         return f"⏳ До конца розыгрыша: {format_remaining_time(end_dt)}"
 
@@ -661,8 +639,6 @@ def build_status_text() -> str:
             return "🚀 Розыгрыш запускается..."
         if seconds_left <= 60:
             return "⏳ Начало нового розыгрыша менее чем через минуту…"
-        if seconds_left > 600:
-            return f"📅 Начало нового розыгрыша: {format_dt(start_dt)}"
         return f"⏳ Начало нового розыгрыша через {format_remaining_time(start_dt)}"
 
     return "ℹ️ Розыгрыш не активен"
@@ -681,9 +657,10 @@ async def update_status_message():
         if not status_message_id:
             return
 
-        edited = await safe_edit_message(CHANNEL_ID, status_message_id, build_status_text())
+        text = build_status_text()
+        edited = await safe_edit_message(CHANNEL_ID, status_message_id, text)
         if not edited:
-            msg = await bot.send_message(CHANNEL_ID, build_status_text())
+            msg = await bot.send_message(CHANNEL_ID, text)
             current_giveaway["status_message_id"] = msg.message_id
             save_giveaway(current_giveaway)
 
@@ -696,9 +673,11 @@ async def start_status_updates():
 
     interval_seconds = 1
     if current_giveaway.get("start_mode") == "scheduled" and not current_giveaway.get("active"):
-        interval_seconds = 5
+        interval_seconds = 1
     if current_giveaway.get("active") and current_giveaway.get("end_mode") == "count":
         interval_seconds = 2
+    if current_giveaway.get("active") and current_giveaway.get("end_mode") == "time":
+        interval_seconds = 1
 
     scheduler.add_job(
         update_status_message,
@@ -954,27 +933,18 @@ async def finish_giveaway(reason: str):
                 current_giveaway["status_message_id"] = msg.message_id
                 save_giveaway(current_giveaway)
 
-            notify_lines = []
-            for i, (winner_id, winner_name, _, chosen_number) in enumerate(winner_rows, start=1):
-                place_text = "победитель" if i == 1 else f"в числе победителей (место {i})"
-                sent = await notify_winner_in_private(winner_id, place_text, chosen_number)
-
-                if sent:
-                    notify_lines.append(f"✅ ЛС отправлено: {winner_name}")
-                else:
-                    notify_lines.append(f"⚠️ Не удалось написать в ЛС: {winner_name}")
-
-            notify_text = "\n".join(notify_lines) if notify_lines else "—"
-
             await notify_admin(
                 f"🎉 Розыгрыш завершён!\n\n"
                 f"Причина: {reason}\n"
                 f"Участников: {len(participants)}\n"
                 f"Победителей: {actual_winners_count}\n\n"
-                f"{winners_text}\n\n"
-                f"Личные сообщения:\n{notify_text}",
+                f"{winners_text}",
                 reply_markup=admin_menu_kb(),
             )
+
+            for i, (winner_id, _, _, chosen_number) in enumerate(winner_rows, start=1):
+                place_text = "победитель" if i == 1 else f"в числе победителей (место {i})"
+                await notify_winner_in_private(winner_id, place_text, chosen_number)
 
         clear_participants()
         clear_giveaway_db()
@@ -1014,6 +984,9 @@ async def start_giveaway(clear_existing_participants: bool = True):
                     args=["вышло время"],
                     id=finish_job_id,
                     replace_existing=True,
+                    misfire_grace_time=5,
+                    coalesce=True,
+                    max_instances=1,
                 )
 
 
@@ -1051,6 +1024,9 @@ async def restore_state():
                             args=["вышло время"],
                             id=finish_job_id,
                             replace_existing=True,
+                            misfire_grace_time=5,
+                            coalesce=True,
+                            max_instances=1,
                         )
         except Exception as e:
             logger.exception("Ошибка восстановления активного розыгрыша: %s", e)
@@ -1083,6 +1059,9 @@ async def restore_state():
                         run_date=start_dt,
                         id=start_job_id,
                         replace_existing=True,
+                        misfire_grace_time=5,
+                        coalesce=True,
+                        max_instances=1,
                     )
         except Exception as e:
             logger.exception("Ошибка восстановления запланированного розыгрыша: %s", e)
@@ -1192,6 +1171,7 @@ async def status_cmd(message: types.Message):
 
     if not current_giveaway.get("active"):
         if current_giveaway.get("start_mode") == "scheduled" and current_giveaway.get("start_datetime"):
+            start_dt = parse_dt(current_giveaway.get("start_datetime"))
             finish_text = (
                 f"по количеству: {current_giveaway.get('end_value')}"
                 if current_giveaway.get("end_mode") == "count"
@@ -1200,7 +1180,7 @@ async def status_cmd(message: types.Message):
 
             await message.answer(
                 f"📅 Запланированный розыгрыш\n\n"
-                f"Старт: {format_dt(parse_dt(current_giveaway.get('start_datetime')))}\n"
+                f"Старт: через {format_remaining_time(start_dt)}\n"
                 f"Завершение: {finish_text}\n"
                 f"Победителей: {current_giveaway.get('winners_count')}\n"
                 f"Номера: {get_numbers_info_text()}\n"
@@ -1261,6 +1241,7 @@ async def cb_admin_status(callback: types.CallbackQuery):
 
     if not current_giveaway.get("active"):
         if current_giveaway.get("start_mode") == "scheduled" and current_giveaway.get("start_datetime"):
+            start_dt = parse_dt(current_giveaway.get("start_datetime"))
             finish_text = (
                 f"по количеству: {current_giveaway.get('end_value')}"
                 if current_giveaway.get("end_mode") == "count"
@@ -1273,7 +1254,7 @@ async def cb_admin_status(callback: types.CallbackQuery):
             await callback.message.answer(
                 f"📅 Запланированный розыгрыш\n\n"
                 f"Код: {current_giveaway.get('code')}\n"
-                f"Старт: {format_dt(parse_dt(current_giveaway.get('start_datetime')))}\n"
+                f"Старт: через {format_remaining_time(start_dt)}\n"
                 f"Завершение: {finish_text}\n"
                 f"Победителей: {current_giveaway.get('winners_count')}\n"
                 f"Номера: {get_numbers_info_text()}\n"
@@ -1406,10 +1387,13 @@ async def cb_publish_now(callback: types.CallbackQuery):
             run_date=start_dt,
             id=start_job_id,
             replace_existing=True,
+            misfire_grace_time=5,
+            coalesce=True,
+            max_instances=1,
         )
 
         await callback.message.answer(
-            f"✅ Розыгрыш запланирован на {format_dt(start_dt)}\n{TIMEZONE_TEXT}",
+            f"✅ Розыгрыш запланирован\nСтарт через {format_remaining_time(start_dt)}",
             reply_markup=admin_menu_kb(),
         )
     except Exception as e:
@@ -1567,8 +1551,7 @@ async def process_start_mode(callback: types.CallbackQuery, state: FSMContext):
         await state.update_data(start_mode="scheduled", start_datetime=start_dt.isoformat())
         await GiveawayForm.waiting_end_mode.set()
         await callback.message.answer(
-            f"✅ Старт установлен на {format_dt(start_dt)}\n{TIMEZONE_TEXT}\n\n"
-            "Как завершать розыгрыш?",
+            f"✅ Старт установлен\nЧерез {format_remaining_time(start_dt)}\n\nКак завершать розыгрыш?",
             reply_markup=end_mode_kb(),
         )
 

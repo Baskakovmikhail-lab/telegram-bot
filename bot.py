@@ -723,7 +723,7 @@ async def start_status_updates():
     scheduler.add_job(
         update_status_message,
         trigger="interval",
-        seconds=30,
+        seconds=2,
         id=STATUS_JOB_ID,
         replace_existing=True
     )
@@ -772,15 +772,6 @@ async def finish_giveaway(reason: str):
     await remove_finish_job()
     await stop_status_updates()
 
-    if current_giveaway.get("status_message_id"):
-        try:
-            await bot.edit_message_text(
-                chat_id=CHANNEL_ID,
-                message_id=current_giveaway["status_message_id"],
-                text="🏁 Розыгрыш завершён"
-            )
-        except Exception:
-            pass
 
     if not participants:
         await bot.send_message(
@@ -966,15 +957,6 @@ async def cancel_cmd(message: types.Message):
     await remove_finish_job()
     await stop_status_updates()
 
-    if current_giveaway.get("status_message_id"):
-        try:
-            await bot.edit_message_text(
-                chat_id=CHANNEL_ID,
-                message_id=current_giveaway["status_message_id"],
-                text="🏁 Розыгрыш завершён"
-            )
-        except Exception:
-            pass
 
     clear_participants()
     clear_giveaway_db()
@@ -1244,15 +1226,6 @@ async def cb_admin_cancel(callback: types.CallbackQuery):
     await remove_finish_job()
     await stop_status_updates()
 
-    if current_giveaway.get("status_message_id"):
-        try:
-            await bot.edit_message_text(
-                chat_id=CHANNEL_ID,
-                message_id=current_giveaway["status_message_id"],
-                text="🏁 Розыгрыш завершён"
-            )
-        except Exception:
-            pass
 
     clear_participants()
     clear_giveaway_db()

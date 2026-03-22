@@ -607,6 +607,24 @@ def build_status_text() -> str:
             if seconds_left <= 0:
                 return "⚡ Розыгрыш завершён"
 
+            if seconds_left <= 60:
+                if seconds_left > 50:
+                    return "⏳ Менее одной минуты"
+                elif seconds_left > 40:
+                    return "⏳ Менее 50 секунд"
+                elif seconds_left > 30:
+                    return "⏳ Менее 40 секунд"
+                elif seconds_left > 20:
+                    return "⏳ Менее 30 секунд"
+                elif seconds_left > 10:
+                    return "⏳ Менее 20 секунд"
+                elif seconds_left > 5:
+                    return "⏳ Менее 10 секунд"
+                elif seconds_left == 5:
+                    return "⏳ Менее 5 секунд"
+                else:
+                    return f"⏳ {seconds_left}"
+
             return f"⏳ До конца розыгрыша: {format_remaining_time(end_dt)}"
 
         total_needed = current_giveaway.get("end_value", 0) or 0
@@ -615,21 +633,6 @@ def build_status_text() -> str:
 
         if left <= 0:
             return "⚡ Все места заняты!"
-
-        if left <= 10:
-            messages = {
-                10: "🔥 Начинается финал...",
-                9: "⚡ Участники заходят всё быстрее...",
-                8: "👀 Напряжение растёт",
-                7: "🎯 Финал всё ближе",
-                6: "🔥 Всё ускоряется...",
-                5: "🚀 Осталась пятёрка мест!",
-                4: "⚡ Почти финал",
-                3: "🔥 Последний рывок!",
-                2: "🎯 Решающий момент...",
-                1: "💣 Последнее место!"
-            }
-            return f"👥 Осталось мест: {left}\n\n{messages.get(left, '')}"
 
         return f"👥 Осталось мест: {left}"
 
@@ -643,7 +646,10 @@ def build_status_text() -> str:
         if seconds_left <= 0:
             return "🚀 Розыгрыш запускается..."
 
-        return f"⏳ До старта нового розыгрыша: {format_remaining_time(start_dt)}"
+        if seconds_left > 600:
+            return f"📅 Начало нового розыгрыша: {format_dt(start_dt)}"
+        else:
+            return f"⏳ Начало нового розыгрыша через {format_remaining_time(start_dt)}"
 
     return "ℹ️ Розыгрыш не активен"
 
@@ -672,7 +678,7 @@ async def start_status_updates():
     scheduler.add_job(
         update_status_message,
         trigger="interval",
-        seconds=5,
+        seconds=1,
         id=STATUS_JOB_ID,
         replace_existing=True
     )
@@ -866,11 +872,7 @@ async def finish_giveaway(reason: str):
             result_text = f"🎉 ПОБЕДИТЕЛИ ОПРЕДЕЛЕНЫ!\n\n🏆 Итоги розыгрыша:\n{winners_text}"
 
         if current_giveaway.get("status_message_id"):
-            await safe_edit_message(
-                CHANNEL_ID,
-                current_giveaway["status_message_id"],
-                result_text
-            )
+            await safe_edit_message(CHANNEL_ID, current_giveaway["status_message_id"], result_text)
         else:
             await bot.send_message(CHANNEL_ID, result_text)
 
@@ -1183,15 +1185,6 @@ async def cb_admin_new(callback: types.CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query_handler(lambda c: c.data == "admin_finish_now")
-async def cb_finish_now(callback: types.CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        return
-
-    await finish_giveaway("завершено вручную")
-    await callback.answer("Розыгрыш завершён")
-
-
 @dp.callback_query_handler(lambda c: c.data == "admin_status")
 async def cb_admin_status(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1247,6 +1240,15 @@ async def cb_admin_status(callback: types.CallbackQuery):
 
     await callback.message.answer(text, reply_markup=kb)
     await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "admin_finish_now")
+async def cb_finish_now(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+
+    await finish_giveaway("завершено вручную")
+    await callback.answer("Розыгрыш завершён")
 
 
 @dp.callback_query_handler(lambda c: c.data == "admin_list")

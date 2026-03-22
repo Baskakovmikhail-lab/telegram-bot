@@ -64,6 +64,7 @@ pending_number_choice = set()
 current_giveaway = {}
 finish_job_id = None
 start_job_id = None
+STATUS_JOB_ID = "giveaway_status_updater"
 
 
 # =========================
@@ -145,7 +146,9 @@ def init_db():
             end_datetime TEXT,
             winners_count INTEGER,
             code TEXT,
-            created_at TEXT
+            created_at TEXT,
+            post_message_id INTEGER,
+            status_message_id INTEGER
         )
     """)
 
@@ -164,6 +167,16 @@ def init_db():
 
     try:
         cur.execute("ALTER TABLE participants ADD COLUMN chosen_number INTEGER UNIQUE")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cur.execute("ALTER TABLE giveaway ADD COLUMN post_message_id INTEGER")
+    except sqlite3.OperationalError:
+        pass
+
+    try:
+        cur.execute("ALTER TABLE giveaway ADD COLUMN status_message_id INTEGER")
     except sqlite3.OperationalError:
         pass
 
@@ -188,7 +201,9 @@ def save_giveaway(data: dict):
             end_datetime = ?,
             winners_count = ?,
             code = ?,
-            created_at = ?
+            created_at = ?,
+            post_message_id = ?,
+            status_message_id = ?
         WHERE id = 1
     """, (
         1 if data.get("active") else 0,
@@ -203,6 +218,8 @@ def save_giveaway(data: dict):
         data.get("winners_count"),
         data.get("code"),
         data.get("created_at"),
+        data.get("post_message_id"),
+        data.get("status_message_id"),
     ))
 
     conn.commit()
@@ -216,7 +233,7 @@ def load_giveaway() -> dict:
     cur.execute("""
         SELECT active, media_type, media_file_id, description, start_mode,
                start_datetime, end_mode, end_value, end_datetime,
-               winners_count, code, created_at
+               winners_count, code, created_at, post_message_id, status_message_id
         FROM giveaway
         WHERE id = 1
     """)
@@ -239,6 +256,8 @@ def load_giveaway() -> dict:
         "winners_count": row[9],
         "code": row[10],
         "created_at": row[11],
+        "post_message_id": row[12],
+        "status_message_id": row[13],
     }
 
 
@@ -259,7 +278,9 @@ def clear_giveaway_db():
             end_datetime = NULL,
             winners_count = NULL,
             code = NULL,
-            created_at = NULL
+            created_at = NULL,
+            post_message_id = NULL,
+            status_message_id = NULL
         WHERE id = 1
     """)
 
@@ -629,6 +650,113 @@ async def ask_for_number_choice(target, resend: bool = False):
         await target.answer(base_text, reply_markup=choose_number_kb())
 
 
+def format_remaining_time(target_dt: Optional[datetime]) -> str:
+    if not target_dt:
+        return "—"
+
+    delta = target_dt - now_utc3()
+    total_seconds = int(delta.total_seconds())
+
+    if total_seconds <= 0:
+        return "меньше минуты"
+
+    days = total_seconds // 86400
+    hours = (total_seconds % 86400) // 3600
+    minutes = (total_seconds % 3600) // 60
+
+    parts = []
+    if days > 0:
+        parts.append(f"{days}д")
+    if hours > 0:
+        parts.append(f"{hours}ч")
+    if minutes > 0:
+        parts.append(f"{minutes}м")
+
+    return " ".join(parts) if parts else "меньше минуты"
+
+
+def build_status_text() -> str:
+    if current_giveaway.get("active"):
+        if current_giveaway.get("end_mode") == "time":
+            return f"⏳ До конца розыгрыша: {format_remaining_time(parse_dt(current_giveaway.get('end_datetime')))}"
+
+        total_needed = current_giveaway.get("end_value", 0) or 0
+        current_count = get_participants_count()
+        left = max(total_needed - current_count, 0)
+        return f"👥 Осталось мест: {left}\nУчастников: {current_count}/{total_needed}"
+
+    if current_giveaway.get("start_mode") == "scheduled" and current_giveaway.get("start_datetime"):
+        return f"⏳ До старта розыгрыша: {format_remaining_time(parse_dt(current_giveaway.get('start_datetime')))}"
+
+    return "ℹ️ Розыгрыш не активен"
+
+
+async def publish_status_message():
+    status_text = build_status_text()
+    msg = await bot.send_message(CHANNEL_ID, status_text)
+    current_giveaway["status_message_id"] = msg.message_id
+    save_giveaway(current_giveaway)
+
+
+async def update_status_message():
+    status_message_id = current_giveaway.get("status_message_id")
+    if not status_message_id:
+        return
+
+    try:
+        await bot.edit_message_text(
+            chat_id=CHANNEL_ID,
+            message_id=status_message_id,
+            text=build_status_text()
+        )
+    except Exception as e:
+        if "Message is not modified" not in str(e):
+            logging.warning(f"Не удалось обновить статус розыгрыша: {e}")
+
+
+async def start_status_updates():
+    try:
+        scheduler.remove_job(STATUS_JOB_ID)
+    except Exception:
+        pass
+
+    scheduler.add_job(
+        update_status_message,
+        trigger="interval",
+        seconds=30,
+        id=STATUS_JOB_ID,
+        replace_existing=True
+    )
+
+
+async def stop_status_updates():
+    try:
+        scheduler.remove_job(STATUS_JOB_ID)
+    except Exception:
+        pass
+
+
+async def publish_giveaway_post():
+    media_type = current_giveaway["media_type"]
+    media_file_id = current_giveaway["media_file_id"]
+    description = current_giveaway["description"]
+
+    if media_type == "video":
+        post = await bot.send_video(CHANNEL_ID, media_file_id, caption=description)
+    else:
+        post = await bot.send_photo(CHANNEL_ID, media_file_id, caption=description)
+
+    current_giveaway["post_message_id"] = post.message_id
+    save_giveaway(current_giveaway)
+
+    if not current_giveaway.get("status_message_id"):
+        await publish_status_message()
+    else:
+        await update_status_message()
+
+    await start_status_updates()
+
+
 # =========================
 # GIVEAWAY CORE
 # =========================
@@ -642,6 +770,17 @@ async def finish_giveaway(reason: str):
     winners_count = current_giveaway.get("winners_count", 1) or 1
 
     await remove_finish_job()
+    await stop_status_updates()
+
+    if current_giveaway.get("status_message_id"):
+        try:
+            await bot.edit_message_text(
+                chat_id=CHANNEL_ID,
+                message_id=current_giveaway["status_message_id"],
+                text="🏁 Розыгрыш завершён"
+            )
+        except Exception:
+            pass
 
     if not participants:
         await bot.send_message(
@@ -707,17 +846,14 @@ async def start_giveaway():
     clear_participants()
     pending_number_choice.clear()
 
-    media_type = current_giveaway["media_type"]
-    media_file_id = current_giveaway["media_file_id"]
-    description = current_giveaway["description"]
-
     current_giveaway["active"] = True
     save_giveaway(current_giveaway)
 
-    if media_type == "video":
-        await bot.send_video(CHANNEL_ID, media_file_id, caption=description)
+    if not current_giveaway.get("post_message_id"):
+        await publish_giveaway_post()
     else:
-        await bot.send_photo(CHANNEL_ID, media_file_id, caption=description)
+        await update_status_message()
+        await start_status_updates()
 
     if current_giveaway["end_mode"] == "time":
         end_dt = parse_dt(current_giveaway.get("end_datetime"))
@@ -747,6 +883,9 @@ async def restore_state():
         return
 
     if current_giveaway.get("active"):
+        await start_status_updates()
+        await update_status_message()
+
         if current_giveaway.get("end_mode") == "time":
             end_dt = parse_dt(current_giveaway.get("end_datetime"))
             if end_dt:
@@ -765,6 +904,9 @@ async def restore_state():
         return
 
     if current_giveaway.get("start_mode") == "scheduled" and current_giveaway.get("start_datetime"):
+        await start_status_updates()
+        await update_status_message()
+
         start_dt = parse_dt(current_giveaway.get("start_datetime"))
         if start_dt:
             if now_utc3() >= start_dt:
@@ -822,6 +964,17 @@ async def cancel_cmd(message: types.Message):
 
     await remove_start_job()
     await remove_finish_job()
+    await stop_status_updates()
+
+    if current_giveaway.get("status_message_id"):
+        try:
+            await bot.edit_message_text(
+                chat_id=CHANNEL_ID,
+                message_id=current_giveaway["status_message_id"],
+                text="🏁 Розыгрыш завершён"
+            )
+        except Exception:
+            pass
 
     clear_participants()
     clear_giveaway_db()
@@ -1089,6 +1242,17 @@ async def cb_admin_cancel(callback: types.CallbackQuery):
 
     await remove_start_job()
     await remove_finish_job()
+    await stop_status_updates()
+
+    if current_giveaway.get("status_message_id"):
+        try:
+            await bot.edit_message_text(
+                chat_id=CHANNEL_ID,
+                message_id=current_giveaway["status_message_id"],
+                text="🏁 Розыгрыш завершён"
+            )
+        except Exception:
+            pass
 
     clear_participants()
     clear_giveaway_db()
@@ -1127,6 +1291,10 @@ async def cb_publish_now(callback: types.CallbackQuery):
         await remove_start_job()
 
         start_dt = parse_dt(current_giveaway["start_datetime"])
+
+        if not current_giveaway.get("post_message_id"):
+            await publish_giveaway_post()
+
         start_job_id = f"start_{int(time.time())}"
 
         scheduler.add_job(
@@ -1218,6 +1386,8 @@ async def cb_pick_number(callback: types.CallbackQuery, state: FSMContext):
         f"Твой номер: {chosen_number}"
     )
     await callback.answer("Номер закреплён")
+
+    await update_status_message()
 
     if current_giveaway.get("end_mode") == "count":
         if get_participants_count() >= current_giveaway.get("end_value"):
@@ -1608,6 +1778,8 @@ async def process_personal_number(message: types.Message, state: FSMContext):
         f"Ты участвуешь в розыгрыше\n"
         f"Твой номер: {chosen_number}"
     )
+
+    await update_status_message()
 
     if current_giveaway.get("end_mode") == "count":
         if get_participants_count() >= current_giveaway.get("end_value"):

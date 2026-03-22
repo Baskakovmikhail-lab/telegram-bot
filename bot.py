@@ -4,8 +4,9 @@ import random
 import asyncio
 import logging
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Set
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
@@ -32,7 +33,6 @@ if not ADMIN_ID_RAW:
     raise RuntimeError("Не задан ADMIN_ID")
 
 ADMIN_ID = int(ADMIN_ID_RAW)
-
 DB_PATH = "bot.db"
 
 UTC_PLUS_3 = timezone(timedelta(hours=3))
@@ -49,14 +49,18 @@ STATUS_JOB_ID = "giveaway_status_updater"
 START_JOB_ID_RESTORED = "start_restored"
 FINISH_JOB_ID_RESTORED = "finish_restored"
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("giveaway_bot")
 
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 scheduler = AsyncIOScheduler(timezone=UTC_PLUS_3)
 
-print("БОТ ЗАПУЩЕН ✅")
+logger.info("БОТ ЗАПУЩЕН ✅")
 
 
 # =========================
@@ -64,11 +68,15 @@ print("БОТ ЗАПУЩЕН ✅")
 # =========================
 last_message_time = {}
 wrong_code_attempts = {}
-pending_number_choice = set()
+pending_number_choice: Set[int] = set()
 
-current_giveaway = {}
+current_giveaway = {"active": False}
 finish_job_id = None
 start_job_id = None
+
+lifecycle_lock = asyncio.Lock()
+join_lock = asyncio.Lock()
+status_lock = asyncio.Lock()
 
 
 # =========================
@@ -163,118 +171,122 @@ def format_remaining_time(target_dt: Optional[datetime]) -> str:
 # SQLITE
 # =========================
 def get_conn():
-    return sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
 
 
 def init_db():
-    conn = get_conn()
-    cur = conn.cursor()
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS giveaway (
-            id INTEGER PRIMARY KEY CHECK (id = 1),
-            active INTEGER NOT NULL DEFAULT 0,
-            media_type TEXT,
-            media_file_id TEXT,
-            description TEXT,
-            start_mode TEXT,
-            start_datetime TEXT,
-            end_mode TEXT,
-            end_value INTEGER,
-            end_datetime TEXT,
-            winners_count INTEGER,
-            code TEXT,
-            created_at TEXT,
-            post_message_id INTEGER,
-            status_message_id INTEGER
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS giveaway (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                active INTEGER NOT NULL DEFAULT 0,
+                media_type TEXT,
+                media_file_id TEXT,
+                description TEXT,
+                start_mode TEXT,
+                start_datetime TEXT,
+                end_mode TEXT,
+                end_value INTEGER,
+                end_datetime TEXT,
+                winners_count INTEGER,
+                code TEXT,
+                created_at TEXT,
+                post_message_id INTEGER,
+                status_message_id INTEGER
+            )
+        """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS participants (
-            user_id INTEGER PRIMARY KEY,
-            username TEXT,
-            joined_at TEXT,
-            chosen_number INTEGER UNIQUE
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS participants (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                joined_at TEXT,
+                chosen_number INTEGER UNIQUE
+            )
+        """)
 
-    cur.execute("INSERT OR IGNORE INTO giveaway (id, active) VALUES (1, 0)")
+        cur.execute("INSERT OR IGNORE INTO giveaway (id, active) VALUES (1, 0)")
 
-    try:
-        cur.execute("ALTER TABLE participants ADD COLUMN chosen_number INTEGER UNIQUE")
-    except sqlite3.OperationalError:
-        pass
+        try:
+            cur.execute("ALTER TABLE participants ADD COLUMN chosen_number INTEGER UNIQUE")
+        except sqlite3.OperationalError:
+            pass
 
-    try:
-        cur.execute("ALTER TABLE giveaway ADD COLUMN post_message_id INTEGER")
-    except sqlite3.OperationalError:
-        pass
+        try:
+            cur.execute("ALTER TABLE giveaway ADD COLUMN post_message_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
 
-    try:
-        cur.execute("ALTER TABLE giveaway ADD COLUMN status_message_id INTEGER")
-    except sqlite3.OperationalError:
-        pass
+        try:
+            cur.execute("ALTER TABLE giveaway ADD COLUMN status_message_id INTEGER")
+        except sqlite3.OperationalError:
+            pass
 
-    conn.commit()
-    conn.close()
+        conn.commit()
 
 
 def save_giveaway(data: dict):
-    conn = get_conn()
-    cur = conn.cursor()
+    payload = {
+        "active": 1 if data.get("active") else 0,
+        "media_type": data.get("media_type"),
+        "media_file_id": data.get("media_file_id"),
+        "description": data.get("description"),
+        "start_mode": data.get("start_mode"),
+        "start_datetime": data.get("start_datetime"),
+        "end_mode": data.get("end_mode"),
+        "end_value": data.get("end_value"),
+        "end_datetime": data.get("end_datetime"),
+        "winners_count": data.get("winners_count"),
+        "code": data.get("code"),
+        "created_at": data.get("created_at"),
+        "post_message_id": data.get("post_message_id"),
+        "status_message_id": data.get("status_message_id"),
+    }
 
-    cur.execute("""
-        UPDATE giveaway
-        SET active = ?,
-            media_type = ?,
-            media_file_id = ?,
-            description = ?,
-            start_mode = ?,
-            start_datetime = ?,
-            end_mode = ?,
-            end_value = ?,
-            end_datetime = ?,
-            winners_count = ?,
-            code = ?,
-            created_at = ?,
-            post_message_id = ?,
-            status_message_id = ?
-        WHERE id = 1
-    """, (
-        1 if data.get("active") else 0,
-        data.get("media_type"),
-        data.get("media_file_id"),
-        data.get("description"),
-        data.get("start_mode"),
-        data.get("start_datetime"),
-        data.get("end_mode"),
-        data.get("end_value"),
-        data.get("end_datetime"),
-        data.get("winners_count"),
-        data.get("code"),
-        data.get("created_at"),
-        data.get("post_message_id"),
-        data.get("status_message_id"),
-    ))
-
-    conn.commit()
-    conn.close()
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE giveaway
+            SET active = :active,
+                media_type = :media_type,
+                media_file_id = :media_file_id,
+                description = :description,
+                start_mode = :start_mode,
+                start_datetime = :start_datetime,
+                end_mode = :end_mode,
+                end_value = :end_value,
+                end_datetime = :end_datetime,
+                winners_count = :winners_count,
+                code = :code,
+                created_at = :created_at,
+                post_message_id = :post_message_id,
+                status_message_id = :status_message_id
+            WHERE id = 1
+            """,
+            payload,
+        )
+        conn.commit()
 
 
 def load_giveaway() -> dict:
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT active, media_type, media_file_id, description, start_mode,
-               start_datetime, end_mode, end_value, end_datetime,
-               winners_count, code, created_at, post_message_id, status_message_id
-        FROM giveaway
-        WHERE id = 1
-    """)
-    row = cur.fetchone()
-    conn.close()
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT active, media_type, media_file_id, description, start_mode,
+                   start_datetime, end_mode, end_value, end_datetime,
+                   winners_count, code, created_at, post_message_id, status_message_id
+            FROM giveaway
+            WHERE id = 1
+            """
+        )
+        row = cur.fetchone()
 
     if not row:
         return {"active": False}
@@ -298,76 +310,70 @@ def load_giveaway() -> dict:
 
 
 def clear_giveaway_db():
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-        UPDATE giveaway
-        SET active = 0,
-            media_type = NULL,
-            media_file_id = NULL,
-            description = NULL,
-            start_mode = NULL,
-            start_datetime = NULL,
-            end_mode = NULL,
-            end_value = NULL,
-            end_datetime = NULL,
-            winners_count = NULL,
-            code = NULL,
-            created_at = NULL,
-            post_message_id = NULL,
-            status_message_id = NULL
-        WHERE id = 1
-    """)
-
-    conn.commit()
-    conn.close()
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            UPDATE giveaway
+            SET active = 0,
+                media_type = NULL,
+                media_file_id = NULL,
+                description = NULL,
+                start_mode = NULL,
+                start_datetime = NULL,
+                end_mode = NULL,
+                end_value = NULL,
+                end_datetime = NULL,
+                winners_count = NULL,
+                code = NULL,
+                created_at = NULL,
+                post_message_id = NULL,
+                status_message_id = NULL
+            WHERE id = 1
+            """
+        )
+        conn.commit()
 
 
 def add_participant(user_id: int, username: str, chosen_number: int) -> bool:
-    conn = get_conn()
-    cur = conn.cursor()
-    ok = True
-
-    try:
-        cur.execute("""
-            INSERT INTO participants (user_id, username, joined_at, chosen_number)
-            VALUES (?, ?, ?, ?)
-        """, (user_id, username, now_utc3().isoformat(), chosen_number))
-        conn.commit()
-    except sqlite3.IntegrityError:
-        ok = False
-    finally:
-        conn.close()
-
-    return ok
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO participants (user_id, username, joined_at, chosen_number)
+                VALUES (?, ?, ?, ?)
+                """,
+                (user_id, username, now_utc3().isoformat(), chosen_number),
+            )
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
 
 
 def participant_exists(user_id: int) -> bool:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM participants WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM participants WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        return row is not None
 
 
 def get_participant_number(user_id: int) -> Optional[int]:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT chosen_number FROM participants WHERE user_id = ?", (user_id,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row and row[0] is not None else None
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT chosen_number FROM participants WHERE user_id = ?", (user_id,))
+        row = cur.fetchone()
+        return row[0] if row and row[0] is not None else None
 
 
 def number_is_taken(number: int) -> bool:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT 1 FROM participants WHERE chosen_number = ?", (number,))
-    row = cur.fetchone()
-    conn.close()
-    return row is not None
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM participants WHERE chosen_number = ?", (number,))
+        row = cur.fetchone()
+        return row is not None
 
 
 def get_current_number_max() -> int:
@@ -385,13 +391,10 @@ def get_numbers_info_text() -> str:
 
 
 def get_free_numbers() -> List[int]:
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("SELECT chosen_number FROM participants WHERE chosen_number IS NOT NULL")
-    taken_rows = cur.fetchall()
-
-    conn.close()
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT chosen_number FROM participants WHERE chosen_number IS NOT NULL")
+        taken_rows = cur.fetchall()
 
     taken = {row[0] for row in taken_rows if row[0] is not None}
     max_number = get_current_number_max()
@@ -399,37 +402,30 @@ def get_free_numbers() -> List[int]:
 
 
 def get_participants() -> List[Tuple[int, str, str, Optional[int]]]:
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT user_id, username, joined_at, chosen_number
-        FROM participants
-        ORDER BY joined_at ASC
-    """)
-    rows = cur.fetchall()
-
-    conn.close()
-    return rows
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT user_id, username, joined_at, chosen_number
+            FROM participants
+            ORDER BY joined_at ASC
+            """
+        )
+        return cur.fetchall()
 
 
 def get_participants_count() -> int:
-    conn = get_conn()
-    cur = conn.cursor()
-
-    cur.execute("SELECT COUNT(*) FROM participants")
-    count = cur.fetchone()[0]
-
-    conn.close()
-    return count
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM participants")
+        return cur.fetchone()[0]
 
 
 def clear_participants():
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM participants")
-    conn.commit()
-    conn.close()
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM participants")
+        conn.commit()
 
 
 # =========================
@@ -478,6 +474,12 @@ def register_wrong_code_attempt(user_id: int):
 
 def reset_wrong_code_attempts(user_id: int):
     wrong_code_attempts.pop(user_id, None)
+
+
+def reset_runtime_state():
+    global current_giveaway
+    current_giveaway = {"active": False}
+    pending_number_choice.clear()
 
 
 def admin_menu_kb() -> InlineKeyboardMarkup:
@@ -541,14 +543,14 @@ def choose_number_kb() -> InlineKeyboardMarkup:
 async def send_step_hint(message: types.Message, text: str):
     await message.answer(
         f"{text}\n\nЕсли передумал — нажми «Отмена».",
-        reply_markup=cancel_kb()
+        reply_markup=cancel_kb(),
     )
 
 
 async def send_step_hint_cb(callback: types.CallbackQuery, text: str):
     await callback.message.answer(
         f"{text}\n\nЕсли передумал — нажми «Отмена».",
-        reply_markup=cancel_kb()
+        reply_markup=cancel_kb(),
     )
 
 
@@ -565,7 +567,7 @@ async def safe_edit_message(chat_id: str, message_id: int, text: str):
         except RetryAfter as e:
             await asyncio.sleep(float(e.timeout) + 0.5)
         except Exception as e:
-            if "Message is not modified" in str(e):
+            if "message is not modified" in str(e).lower():
                 return
             if "retry in" in str(e).lower():
                 wait_seconds = 2
@@ -577,7 +579,7 @@ async def safe_edit_message(chat_id: str, message_id: int, text: str):
                     pass
                 await asyncio.sleep(wait_seconds + 0.5)
             else:
-                logging.warning(f"Не удалось отредактировать сообщение: {e}")
+                logger.warning("Не удалось отредактировать сообщение: %s", e)
                 return
 
 
@@ -590,8 +592,14 @@ async def safe_delete_message(chat_id: str, message_id: Optional[int]):
         pass
 
 
+async def notify_admin(text: str, reply_markup=None):
+    try:
+        await bot.send_message(ADMIN_ID, text, reply_markup=reply_markup)
+    except Exception as e:
+        logger.exception("Не удалось отправить сообщение админу: %s", e)
+
+
 def build_status_text() -> str:
-    # АКТИВНЫЙ РОЗЫГРЫШ
     if current_giveaway.get("active"):
         if current_giveaway.get("end_mode") == "count":
             total_needed = current_giveaway.get("end_value", 0) or 0
@@ -600,7 +608,6 @@ def build_status_text() -> str:
 
             if left <= 0:
                 return "🎉 Розыгрыш завершён!"
-
             if left == 1:
                 return "👥 Осталось мест: 1\n\n🚨 Последний шанс!"
             if left == 2:
@@ -613,7 +620,6 @@ def build_status_text() -> str:
                 return "👥 Осталось мест: 5\n\n🔥 Почти финал!"
             if left <= 10:
                 return f"👥 Осталось мест: {left}\n\n⚡ Быстро разбирают!"
-
             return f"👥 Осталось мест: {left}"
 
         end_dt = parse_dt(current_giveaway.get("end_datetime"))
@@ -621,7 +627,6 @@ def build_status_text() -> str:
             return "⏳ Розыгрыш идёт"
 
         seconds_left = int((end_dt - now_utc3()).total_seconds())
-
         if seconds_left <= 0:
             return "🎉 Розыгрыш завершён!"
 
@@ -640,21 +645,18 @@ def build_status_text() -> str:
                 return "⏳ Менее 10 секунд"
             if seconds_left == 5:
                 return "⏳ Менее 5 секунд"
-            return f"⏳ {seconds_left}"
+            return f"⏳ {seconds_left} сек"
 
         return f"⏳ До конца розыгрыша: {format_remaining_time(end_dt)}"
 
-    # ДО СТАРТА
     if current_giveaway.get("start_mode") == "scheduled":
         start_dt = parse_dt(current_giveaway.get("start_datetime"))
         if not start_dt:
             return "⏳ Розыгрыш скоро начнётся"
 
         seconds_left = int((start_dt - now_utc3()).total_seconds())
-
         if seconds_left <= 0:
             return "🚀 Розыгрыш запускается..."
-
         if seconds_left > 600:
             return f"📅 Начало нового розыгрыша: {format_dt(start_dt)}"
         return f"⏳ Начало нового розыгрыша через {format_remaining_time(start_dt)}"
@@ -670,10 +672,11 @@ async def publish_status_message():
 
 
 async def update_status_message():
-    status_message_id = current_giveaway.get("status_message_id")
-    if not status_message_id:
-        return
-    await safe_edit_message(CHANNEL_ID, status_message_id, build_status_text())
+    async with status_lock:
+        status_message_id = current_giveaway.get("status_message_id")
+        if not status_message_id:
+            return
+        await safe_edit_message(CHANNEL_ID, status_message_id, build_status_text())
 
 
 async def start_status_updates():
@@ -685,7 +688,6 @@ async def start_status_updates():
     interval_seconds = 1
     if current_giveaway.get("start_mode") == "scheduled" and not current_giveaway.get("active"):
         interval_seconds = 5
-
     if current_giveaway.get("active") and current_giveaway.get("end_mode") == "count":
         interval_seconds = 2
 
@@ -694,7 +696,9 @@ async def start_status_updates():
         trigger="interval",
         seconds=interval_seconds,
         id=STATUS_JOB_ID,
-        replace_existing=True
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
     )
 
 
@@ -706,9 +710,12 @@ async def stop_status_updates():
 
 
 async def publish_giveaway_post():
-    media_type = current_giveaway["media_type"]
-    media_file_id = current_giveaway["media_file_id"]
-    description = current_giveaway["description"]
+    media_type = current_giveaway.get("media_type")
+    media_file_id = current_giveaway.get("media_file_id")
+    description = current_giveaway.get("description")
+
+    if not media_type or not media_file_id:
+        raise RuntimeError("Не хватает медиа для публикации")
 
     if media_type == "video":
         post = await bot.send_video(CHANNEL_ID, media_file_id, caption=description)
@@ -737,7 +744,7 @@ async def notify_winner_in_private(user_id: int, place_text: str, chosen_number:
             user_id,
             f"🎉 Поздравляем!\n"
             f"Ты {place_text} в розыгрыше.{number_text}\n\n"
-            f"Напиши администратору для получения приза."
+            f"Напиши администратору для получения приза.",
         )
         return True
     except Exception:
@@ -772,37 +779,37 @@ def get_time_mode_block_range(participant_index: int) -> Tuple[int, int]:
 
 
 def get_taken_numbers_in_range(start: int, end: int) -> set:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(
-        """
-        SELECT chosen_number
-        FROM participants
-        WHERE chosen_number BETWEEN ? AND ?
-        """,
-        (start, end)
-    )
-    rows = cur.fetchall()
-    conn.close()
+    with closing(get_conn()) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT chosen_number
+            FROM participants
+            WHERE chosen_number BETWEEN ? AND ?
+            """,
+            (start, end),
+        )
+        rows = cur.fetchall()
     return {row[0] for row in rows if row[0] is not None}
 
 
 async def assign_time_mode_number(user_id: int, display_name: str) -> Optional[int]:
-    for _ in range(10):
-        participant_index = get_participants_count() + 1
-        start, end = get_time_mode_block_range(participant_index)
-        taken = get_taken_numbers_in_range(start, end)
-        free_numbers = [n for n in range(start, end + 1) if n not in taken]
+    async with join_lock:
+        for _ in range(10):
+            participant_index = get_participants_count() + 1
+            start, end = get_time_mode_block_range(participant_index)
+            taken = get_taken_numbers_in_range(start, end)
+            free_numbers = [n for n in range(start, end + 1) if n not in taken]
 
-        if not free_numbers:
-            continue
+            if not free_numbers:
+                continue
 
-        chosen_number = random.choice(free_numbers)
-        ok = add_participant(user_id, display_name, chosen_number)
-        if ok:
-            return chosen_number
+            chosen_number = random.choice(free_numbers)
+            ok = add_participant(user_id, display_name, chosen_number)
+            if ok:
+                return chosen_number
 
-        await asyncio.sleep(0.05)
+            await asyncio.sleep(0.05)
 
     return None
 
@@ -836,182 +843,225 @@ async def ask_for_number_choice(target, resend: bool = False):
 # =========================
 # GIVEAWAY CORE
 # =========================
+async def cleanup_current_giveaway_messages(delete_post: bool = True):
+    if current_giveaway.get("status_message_id"):
+        await safe_delete_message(CHANNEL_ID, current_giveaway.get("status_message_id"))
+    if delete_post and current_giveaway.get("post_message_id"):
+        await safe_delete_message(CHANNEL_ID, current_giveaway.get("post_message_id"))
+
+
+async def cancel_current_giveaway(reason_text: str):
+    async with lifecycle_lock:
+        await remove_start_job()
+        await remove_finish_job()
+        await stop_status_updates()
+        await cleanup_current_giveaway_messages(delete_post=True)
+        clear_participants()
+        clear_giveaway_db()
+        reset_runtime_state()
+        await notify_admin(reason_text, reply_markup=admin_menu_kb())
+
+
+async def maybe_finish_count_mode():
+    if not current_giveaway.get("active"):
+        return
+    if current_giveaway.get("end_mode") != "count":
+        return
+
+    target = current_giveaway.get("end_value") or 0
+    if target > 0 and get_participants_count() >= target:
+        await finish_giveaway("набрано нужное количество участников")
+    else:
+        await update_status_message()
+
+
 async def finish_giveaway(reason: str):
     global current_giveaway
 
-    if not current_giveaway.get("active"):
-        return
+    async with lifecycle_lock:
+        if not current_giveaway.get("active"):
+            return
 
-    participants = get_participants()
-    winners_count = current_giveaway.get("winners_count", 1) or 1
+        participants = get_participants()
+        winners_count = current_giveaway.get("winners_count", 1) or 1
 
-    await remove_finish_job()
-    await stop_status_updates()
+        await remove_finish_job()
+        await stop_status_updates()
 
-    if not participants:
-        if current_giveaway.get("status_message_id"):
-            await safe_edit_message(
-                CHANNEL_ID,
-                current_giveaway["status_message_id"],
-                "🏁 Розыгрыш завершён\n\nУчастников нет ❌"
-            )
+        if not participants:
+            if current_giveaway.get("status_message_id"):
+                await safe_edit_message(
+                    CHANNEL_ID,
+                    current_giveaway["status_message_id"],
+                    "🏁 Розыгрыш завершён\n\nУчастников нет ❌",
+                )
 
-        await bot.send_message(
-            ADMIN_ID,
-            f"Розыгрыш завершён ({reason}), но участников нет ❌",
-            reply_markup=admin_menu_kb()
-        )
-    else:
-        actual_winners_count = min(winners_count, len(participants))
-        winner_rows = random.sample(participants, actual_winners_count)
-
-        medals = ["🥇", "🥈", "🥉"]
-        winners_lines = []
-
-        for i, (_, winner_name, _, chosen_number) in enumerate(winner_rows, start=1):
-            medal = medals[i - 1] if i <= len(medals) else f"{i}."
-            number_text = f" — №{chosen_number}" if chosen_number is not None else ""
-            winners_lines.append(f"{medal} {winner_name}{number_text}")
-
-        winners_text = "\n".join(winners_lines)
-
-        if len(winner_rows) == 1:
-            _, winner_name, _, chosen_number = winner_rows[0]
-            result_text = (
-                f"🎉 ПОБЕДИТЕЛЬ ОПРЕДЕЛЁН!\n\n"
-                f"🏆 {winner_name}\n"
-                f"🎯 Номер: {chosen_number}"
+            await notify_admin(
+                f"Розыгрыш завершён ({reason}), но участников нет ❌",
+                reply_markup=admin_menu_kb(),
             )
         else:
-            result_text = f"🎉 ПОБЕДИТЕЛИ ОПРЕДЕЛЕНЫ!\n\n🏆 Итоги розыгрыша:\n{winners_text}"
+            actual_winners_count = min(winners_count, len(participants))
+            winner_rows = random.sample(participants, actual_winners_count)
 
-        if current_giveaway.get("status_message_id"):
-            await safe_edit_message(CHANNEL_ID, current_giveaway["status_message_id"], result_text)
-        else:
-            await bot.send_message(CHANNEL_ID, result_text)
+            medals = ["🥇", "🥈", "🥉"]
+            winners_lines = []
 
-        notify_lines = []
-        for i, (winner_id, winner_name, _, chosen_number) in enumerate(winner_rows, start=1):
-            place_text = "победитель" if i == 1 else f"в числе победителей (место {i})"
-            sent = await notify_winner_in_private(winner_id, place_text, chosen_number)
+            for i, (_, winner_name, _, chosen_number) in enumerate(winner_rows, start=1):
+                medal = medals[i - 1] if i <= len(medals) else f"{i}."
+                number_text = f" — №{chosen_number}" if chosen_number is not None else ""
+                winners_lines.append(f"{medal} {winner_name}{number_text}")
 
-            if sent:
-                notify_lines.append(f"✅ ЛС отправлено: {winner_name}")
+            winners_text = "\n".join(winners_lines)
+
+            if len(winner_rows) == 1:
+                _, winner_name, _, chosen_number = winner_rows[0]
+                result_text = (
+                    f"🎉 ПОБЕДИТЕЛЬ ОПРЕДЕЛЁН!\n\n"
+                    f"🏆 {winner_name}\n"
+                    f"🎯 Номер: {chosen_number}"
+                )
             else:
-                notify_lines.append(f"⚠️ Не удалось написать в ЛС: {winner_name}")
+                result_text = f"🎉 ПОБЕДИТЕЛИ ОПРЕДЕЛЕНЫ!\n\n🏆 Итоги розыгрыша:\n{winners_text}"
 
-        notify_text = "\n".join(notify_lines) if notify_lines else "—"
+            if current_giveaway.get("status_message_id"):
+                await safe_edit_message(CHANNEL_ID, current_giveaway["status_message_id"], result_text)
+            else:
+                await bot.send_message(CHANNEL_ID, result_text)
 
-        await bot.send_message(
-            ADMIN_ID,
-            f"🎉 Розыгрыш завершён!\n\n"
-            f"Причина: {reason}\n"
-            f"Участников: {len(participants)}\n"
-            f"Победителей: {actual_winners_count}\n\n"
-            f"{winners_text}\n\n"
-            f"Личные сообщения:\n{notify_text}",
-            reply_markup=admin_menu_kb()
-        )
+            notify_lines = []
+            for i, (winner_id, winner_name, _, chosen_number) in enumerate(winner_rows, start=1):
+                place_text = "победитель" if i == 1 else f"в числе победителей (место {i})"
+                sent = await notify_winner_in_private(winner_id, place_text, chosen_number)
 
-    current_giveaway = {"active": False}
-    clear_participants()
-    clear_giveaway_db()
-    pending_number_choice.clear()
+                if sent:
+                    notify_lines.append(f"✅ ЛС отправлено: {winner_name}")
+                else:
+                    notify_lines.append(f"⚠️ Не удалось написать в ЛС: {winner_name}")
 
+            notify_text = "\n".join(notify_lines) if notify_lines else "—"
 
-async def start_giveaway():
-    global current_giveaway, finish_job_id
-
-    clear_participants()
-    pending_number_choice.clear()
-
-    current_giveaway["active"] = True
-    save_giveaway(current_giveaway)
-
-    await publish_giveaway_post()
-    await publish_active_status_under_post()
-
-    if current_giveaway["end_mode"] == "time":
-        end_dt = parse_dt(current_giveaway.get("end_datetime"))
-        if end_dt:
-            finish_job_id = f"finish_{int(time.time())}"
-            scheduler.add_job(
-                finish_giveaway,
-                trigger="date",
-                run_date=end_dt,
-                args=["вышло время"],
-                id=finish_job_id,
-                replace_existing=True
+            await notify_admin(
+                f"🎉 Розыгрыш завершён!\n\n"
+                f"Причина: {reason}\n"
+                f"Участников: {len(participants)}\n"
+                f"Победителей: {actual_winners_count}\n\n"
+                f"{winners_text}\n\n"
+                f"Личные сообщения:\n{notify_text}",
+                reply_markup=admin_menu_kb(),
             )
+
+        clear_participants()
+        clear_giveaway_db()
+        reset_runtime_state()
+
+
+async def start_giveaway(clear_existing_participants: bool = True):
+    global finish_job_id
+
+    async with lifecycle_lock:
+        if clear_existing_participants:
+            clear_participants()
+        pending_number_choice.clear()
+
+        current_giveaway["active"] = True
+        save_giveaway(current_giveaway)
+
+        try:
+            if not current_giveaway.get("post_message_id"):
+                await publish_giveaway_post()
+            await publish_active_status_under_post()
+        except Exception as e:
+            logger.exception("Ошибка публикации розыгрыша: %s", e)
+            current_giveaway["active"] = False
+            save_giveaway(current_giveaway)
+            await notify_admin(f"Ошибка публикации розыгрыша: {e}", reply_markup=admin_menu_kb())
+            return
+
+        if current_giveaway.get("end_mode") == "time":
+            end_dt = parse_dt(current_giveaway.get("end_datetime"))
+            if end_dt:
+                finish_job_id = f"finish_{int(time.time())}"
+                scheduler.add_job(
+                    finish_giveaway,
+                    trigger="date",
+                    run_date=end_dt,
+                    args=["вышло время"],
+                    id=finish_job_id,
+                    replace_existing=True,
+                )
 
 
 async def scheduled_start():
-    await start_giveaway()
+    await start_giveaway(clear_existing_participants=True)
 
 
 async def restore_state():
     global current_giveaway, finish_job_id, start_job_id
 
-    current_giveaway = load_giveaway()
-
-    if not current_giveaway:
-        current_giveaway = {"active": False}
-        return
+    current_giveaway = load_giveaway() or {"active": False}
 
     if current_giveaway.get("active"):
-        if not current_giveaway.get("post_message_id"):
-            await start_giveaway()
-            return
+        try:
+            if not current_giveaway.get("post_message_id"):
+                await publish_giveaway_post()
 
-        if not current_giveaway.get("status_message_id"):
-            await publish_status_message()
+            if not current_giveaway.get("status_message_id"):
+                await publish_status_message()
 
-        await start_status_updates()
-        await update_status_message()
+            await start_status_updates()
+            await update_status_message()
 
-        if current_giveaway.get("end_mode") == "time":
-            end_dt = parse_dt(current_giveaway.get("end_datetime"))
-            if end_dt:
-                if now_utc3() >= end_dt:
-                    await finish_giveaway("вышло время после перезапуска")
-                else:
-                    finish_job_id = FINISH_JOB_ID_RESTORED
-                    scheduler.add_job(
-                        finish_giveaway,
-                        trigger="date",
-                        run_date=end_dt,
-                        args=["вышло время"],
-                        id=finish_job_id,
-                        replace_existing=True
-                    )
+            if current_giveaway.get("end_mode") == "time":
+                end_dt = parse_dt(current_giveaway.get("end_datetime"))
+                if end_dt:
+                    if now_utc3() >= end_dt:
+                        await finish_giveaway("вышло время после перезапуска")
+                    else:
+                        finish_job_id = FINISH_JOB_ID_RESTORED
+                        scheduler.add_job(
+                            finish_giveaway,
+                            trigger="date",
+                            run_date=end_dt,
+                            args=["вышло время"],
+                            id=finish_job_id,
+                            replace_existing=True,
+                        )
+        except Exception as e:
+            logger.exception("Ошибка восстановления активного розыгрыша: %s", e)
+            await notify_admin(f"Ошибка восстановления активного розыгрыша: {e}")
         return
 
     if current_giveaway.get("start_mode") == "scheduled" and current_giveaway.get("start_datetime"):
-        if current_giveaway.get("post_message_id"):
-            await safe_delete_message(CHANNEL_ID, current_giveaway.get("post_message_id"))
-            current_giveaway["post_message_id"] = None
-            save_giveaway(current_giveaway)
+        try:
+            if current_giveaway.get("post_message_id"):
+                await safe_delete_message(CHANNEL_ID, current_giveaway.get("post_message_id"))
+                current_giveaway["post_message_id"] = None
+                save_giveaway(current_giveaway)
 
-        if not current_giveaway.get("status_message_id"):
-            await publish_status_message()
-        else:
-            await update_status_message()
-
-        await start_status_updates()
-
-        start_dt = parse_dt(current_giveaway.get("start_datetime"))
-        if start_dt:
-            if now_utc3() >= start_dt:
-                await start_giveaway()
+            if not current_giveaway.get("status_message_id"):
+                await publish_status_message()
             else:
-                start_job_id = START_JOB_ID_RESTORED
-                scheduler.add_job(
-                    scheduled_start,
-                    trigger="date",
-                    run_date=start_dt,
-                    id=start_job_id,
-                    replace_existing=True
-                )
+                await update_status_message()
+
+            await start_status_updates()
+
+            start_dt = parse_dt(current_giveaway.get("start_datetime"))
+            if start_dt:
+                if now_utc3() >= start_dt:
+                    await start_giveaway(clear_existing_participants=True)
+                else:
+                    start_job_id = START_JOB_ID_RESTORED
+                    scheduler.add_job(
+                        scheduled_start,
+                        trigger="date",
+                        run_date=start_dt,
+                        id=start_job_id,
+                        replace_existing=True,
+                    )
+        except Exception as e:
+            logger.exception("Ошибка восстановления запланированного розыгрыша: %s", e)
+            await notify_admin(f"Ошибка восстановления запланированного розыгрыша: {e}")
 
 
 async def on_startup(_):
@@ -1019,11 +1069,7 @@ async def on_startup(_):
     init_db()
     scheduler.start()
     await restore_state()
-    await bot.send_message(
-        ADMIN_ID,
-        "Бот запущен ✅\n\nВыбери действие:",
-        reply_markup=admin_menu_kb()
-    )
+    await notify_admin("Бот запущен ✅\n\nВыбери действие:", reply_markup=admin_menu_kb())
 
 
 # =========================
@@ -1049,26 +1095,10 @@ async def cancel_setup_cmd(message: types.Message, state: FSMContext):
 
 @dp.message_handler(commands=["cancel"])
 async def cancel_cmd(message: types.Message):
-    global current_giveaway
-
     if not is_admin(message.from_user.id):
         return
 
-    await remove_start_job()
-    await remove_finish_job()
-    await stop_status_updates()
-
-    if current_giveaway.get("status_message_id"):
-        await safe_delete_message(CHANNEL_ID, current_giveaway.get("status_message_id"))
-    if current_giveaway.get("post_message_id") and not current_giveaway.get("active"):
-        await safe_delete_message(CHANNEL_ID, current_giveaway.get("post_message_id"))
-
-    clear_participants()
-    clear_giveaway_db()
-    current_giveaway = {"active": False}
-    pending_number_choice.clear()
-
-    await message.answer("Розыгрыш отменён ❌", reply_markup=admin_menu_kb())
+    await cancel_current_giveaway("Розыгрыш отменён ❌")
 
 
 # =========================
@@ -1150,7 +1180,7 @@ async def status_cmd(message: types.Message):
                 f"Победителей: {current_giveaway.get('winners_count')}\n"
                 f"Номера: {get_numbers_info_text()}\n"
                 f"{TIMEZONE_TEXT}",
-                reply_markup=admin_menu_kb()
+                reply_markup=admin_menu_kb(),
             )
             return
 
@@ -1194,7 +1224,7 @@ async def cb_admin_new(callback: types.CallbackQuery):
     await GiveawayForm.waiting_media.set()
     await send_step_hint_cb(
         callback,
-        "Отправь фото или видео для поста.\n\nМожно прислать как медиа или как файл."
+        "Отправь фото или видео для поста.\n\nМожно прислать как медиа или как файл.",
     )
     await callback.answer()
 
@@ -1223,7 +1253,7 @@ async def cb_admin_status(callback: types.CallbackQuery):
                 f"Победителей: {current_giveaway.get('winners_count')}\n"
                 f"Номера: {get_numbers_info_text()}\n"
                 f"{TIMEZONE_TEXT}",
-                reply_markup=kb
+                reply_markup=kb,
             )
             await callback.answer()
             return
@@ -1290,26 +1320,10 @@ async def cb_admin_list(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == "admin_cancel")
 async def cb_admin_cancel(callback: types.CallbackQuery):
-    global current_giveaway
-
     if not is_admin(callback.from_user.id):
         return
 
-    await remove_start_job()
-    await remove_finish_job()
-    await stop_status_updates()
-
-    if current_giveaway.get("status_message_id"):
-        await safe_delete_message(CHANNEL_ID, current_giveaway.get("status_message_id"))
-    if current_giveaway.get("post_message_id") and not current_giveaway.get("active"):
-        await safe_delete_message(CHANNEL_ID, current_giveaway.get("post_message_id"))
-
-    clear_participants()
-    clear_giveaway_db()
-    current_giveaway = {"active": False}
-    pending_number_choice.clear()
-
-    await callback.message.answer("Активный или запланированный розыгрыш отменён ❌", reply_markup=admin_menu_kb())
+    await cancel_current_giveaway("Активный или запланированный розыгрыш отменён ❌")
     await callback.answer()
 
 
@@ -1334,13 +1348,25 @@ async def cb_publish_now(callback: types.CallbackQuery):
         await callback.answer("Нет данных для публикации", show_alert=True)
         return
 
-    if current_giveaway["start_mode"] == "now":
-        await start_giveaway()
+    if current_giveaway.get("start_mode") == "now":
+        await start_giveaway(clear_existing_participants=True)
         await callback.message.answer("✅ Розыгрыш опубликован", reply_markup=admin_menu_kb())
-    else:
-        await remove_start_job()
-        start_dt = parse_dt(current_giveaway["start_datetime"])
+        await callback.answer()
+        return
 
+    await remove_start_job()
+    start_dt = parse_dt(current_giveaway.get("start_datetime"))
+    if not start_dt:
+        await callback.message.answer("Ошибка: время старта не задано", reply_markup=admin_menu_kb())
+        await callback.answer()
+        return
+
+    if start_dt <= now_utc3():
+        await callback.message.answer("Ошибка: время старта уже прошло", reply_markup=admin_menu_kb())
+        await callback.answer()
+        return
+
+    try:
         if not current_giveaway.get("status_message_id"):
             await publish_status_message()
         else:
@@ -1354,13 +1380,16 @@ async def cb_publish_now(callback: types.CallbackQuery):
             trigger="date",
             run_date=start_dt,
             id=start_job_id,
-            replace_existing=True
+            replace_existing=True,
         )
 
         await callback.message.answer(
             f"✅ Розыгрыш запланирован на {format_dt(start_dt)}\n{TIMEZONE_TEXT}",
-            reply_markup=admin_menu_kb()
+            reply_markup=admin_menu_kb(),
         )
+    except Exception as e:
+        logger.exception("Ошибка планирования розыгрыша: %s", e)
+        await callback.message.answer(f"Ошибка планирования: {e}", reply_markup=admin_menu_kb())
 
     await callback.answer()
 
@@ -1376,7 +1405,7 @@ async def cb_publish_cancel(callback: types.CallbackQuery):
         await safe_delete_message(CHANNEL_ID, current_giveaway.get("status_message_id"))
 
     clear_giveaway_db()
-    current_giveaway = {"active": False}
+    reset_runtime_state()
 
     await callback.message.answer("Публикация отменена ❌", reply_markup=admin_menu_kb())
     await callback.answer()
@@ -1401,25 +1430,26 @@ async def cb_pick_number(callback: types.CallbackQuery, state: FSMContext):
         await callback.answer("Сначала отправь код для участия", show_alert=True)
         return
 
-    free_numbers = get_free_numbers()
-    if not free_numbers:
-        pending_number_choice.discard(user_id)
-        await state.finish()
-        await callback.message.answer("Свободных номеров не осталось ❌")
-        await callback.answer()
-        return
+    async with join_lock:
+        free_numbers = get_free_numbers()
+        if not free_numbers:
+            pending_number_choice.discard(user_id)
+            await state.finish()
+            await callback.message.answer("Свободных номеров не осталось ❌")
+            await callback.answer()
+            return
 
-    chosen_number = random.choice(free_numbers)
+        chosen_number = random.choice(free_numbers)
 
-    username = callback.from_user.username
-    full_name = callback.from_user.full_name
-    display_name = f"@{username}" if username else full_name
+        username = callback.from_user.username
+        full_name = callback.from_user.full_name
+        display_name = f"@{username}" if username else full_name
 
-    ok = add_participant(user_id, display_name, chosen_number)
-    if not ok:
-        await callback.answer("Этот номер только что заняли", show_alert=True)
-        await ask_for_number_choice(callback, resend=True)
-        return
+        ok = add_participant(user_id, display_name, chosen_number)
+        if not ok:
+            await callback.answer("Этот номер только что заняли", show_alert=True)
+            await ask_for_number_choice(callback, resend=True)
+            return
 
     pending_number_choice.discard(user_id)
     reset_wrong_code_attempts(user_id)
@@ -1432,12 +1462,7 @@ async def cb_pick_number(callback: types.CallbackQuery, state: FSMContext):
     )
     await callback.answer("Номер закреплён")
 
-    if current_giveaway.get("end_mode") == "count":
-        if get_participants_count() >= current_giveaway.get("end_value"):
-            await finish_giveaway("набрано нужное количество участников")
-            return
-
-    await update_status_message()
+    await maybe_finish_count_mode()
 
 
 # =========================
@@ -1490,7 +1515,7 @@ async def process_description(message: types.Message, state: FSMContext):
 
 @dp.callback_query_handler(
     lambda c: c.data in ["start_now", "start_schedule", "start_5", "start_15", "start_30", "start_60"],
-    state=GiveawayForm.waiting_start_mode
+    state=GiveawayForm.waiting_start_mode,
 )
 async def process_start_mode(callback: types.CallbackQuery, state: FSMContext):
     now = now_utc3()
@@ -1499,15 +1524,13 @@ async def process_start_mode(callback: types.CallbackQuery, state: FSMContext):
         await state.update_data(start_mode="now", start_datetime=None)
         await GiveawayForm.waiting_end_mode.set()
         await callback.message.answer("Как завершать розыгрыш?", reply_markup=end_mode_kb())
-
     elif callback.data == "start_schedule":
         await state.update_data(start_mode="scheduled")
         await GiveawayForm.waiting_start_datetime.set()
         await send_step_hint_cb(
             callback,
-            f"Введи дату и время старта в формате:\n01.01.2000 23:59\n\n{current_time_hint()}"
+            f"Введи дату и время старта в формате:\n01.01.2000 23:59\n\n{current_time_hint()}",
         )
-
     else:
         if callback.data == "start_5":
             start_dt = now + timedelta(minutes=5)
@@ -1523,7 +1546,7 @@ async def process_start_mode(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.answer(
             f"✅ Старт установлен на {format_dt(start_dt)}\n{TIMEZONE_TEXT}\n\n"
             "Как завершать розыгрыш?",
-            reply_markup=end_mode_kb()
+            reply_markup=end_mode_kb(),
         )
 
     await callback.answer()
@@ -1557,7 +1580,7 @@ async def process_end_mode(callback: types.CallbackQuery, state: FSMContext):
         await GiveawayForm.waiting_end_datetime.set()
         await send_step_hint_cb(
             callback,
-            f"Введи дату и время завершения в формате:\n01.01.2000 23:59\n\n{current_time_hint()}"
+            f"Введи дату и время завершения в формате:\n01.01.2000 23:59\n\n{current_time_hint()}",
         )
     await callback.answer()
 
@@ -1627,7 +1650,7 @@ async def process_winners_count(message: types.Message, state: FSMContext):
 async def process_code(message: types.Message, state: FSMContext):
     global current_giveaway
 
-    code = message.text.strip()
+    code = (message.text or "").strip()
     if not code:
         await send_step_hint(message, "Код не должен быть пустым.")
         return
@@ -1662,7 +1685,7 @@ async def process_code(message: types.Message, state: FSMContext):
 
     await message.answer(
         "👇 Так будет выглядеть пост\n\nЕсли всё ок — нажми «Опубликовать».",
-        reply_markup=publish_preview_kb()
+        reply_markup=publish_preview_kb(),
     )
 
     await state.finish()
@@ -1691,7 +1714,7 @@ async def fallback_waiting_start_mode(message: types.Message):
         return
     await message.answer(
         "Сейчас выбери способ старта кнопками ниже.\n\nЕсли передумал — нажми «Отмена».",
-        reply_markup=start_mode_kb()
+        reply_markup=start_mode_kb(),
     )
 
 
@@ -1708,7 +1731,7 @@ async def fallback_waiting_end_mode(message: types.Message):
         return
     await message.answer(
         "Сейчас выбери способ завершения кнопками ниже.\n\nЕсли передумал — нажми «Отмена».",
-        reply_markup=end_mode_kb()
+        reply_markup=end_mode_kb(),
     )
 
 
@@ -1755,7 +1778,7 @@ async def process_personal_number(message: types.Message, state: FSMContext):
 
     if user_id not in pending_number_choice:
         await state.finish()
-        await message.answer("Сначала отправь код для участия.")
+        await message.answer("Сначала отправь код для участия. Если бот перезапускался — отправь код ещё раз.")
         return
 
     max_number = get_current_number_max()
@@ -1766,54 +1789,55 @@ async def process_personal_number(message: types.Message, state: FSMContext):
         await message.answer(
             f"❌ Напиши число от {NUMBER_MIN} до {max_number}\n"
             f"🎲 Или нажми «Случайный номер»",
-            reply_markup=choose_number_kb()
+            reply_markup=choose_number_kb(),
         )
         return
 
     if chosen_number < NUMBER_MIN or chosen_number > max_number:
         await message.answer(
             f"❌ Можно выбрать число только от {NUMBER_MIN} до {max_number}",
-            reply_markup=choose_number_kb()
+            reply_markup=choose_number_kb(),
         )
         return
 
-    if number_is_taken(chosen_number):
-        free_numbers = get_free_numbers()
+    async with join_lock:
+        if number_is_taken(chosen_number):
+            free_numbers = get_free_numbers()
 
-        if not free_numbers:
-            await message.answer("Свободных номеров не осталось ❌")
-            pending_number_choice.discard(user_id)
-            await state.finish()
+            if not free_numbers:
+                await message.answer("Свободных номеров не осталось ❌")
+                pending_number_choice.discard(user_id)
+                await state.finish()
+                return
+
+            if len(free_numbers) <= 10:
+                hint = ", ".join(map(str, free_numbers))
+                await message.answer(
+                    f"⚠️ Номер {chosen_number} уже занят\n\n"
+                    f"Свободные числа:\n{hint}\n\n"
+                    f"🎲 Или нажми «Случайный номер»",
+                    reply_markup=choose_number_kb(),
+                )
+            else:
+                await message.answer(
+                    f"⚠️ Номер {chosen_number} уже занят\n"
+                    f"✍️ Напиши другой номер\n"
+                    f"🎲 Или нажми «Случайный номер»",
+                    reply_markup=choose_number_kb(),
+                )
             return
 
-        if len(free_numbers) <= 10:
-            hint = ", ".join(map(str, free_numbers))
-            await message.answer(
-                f"⚠️ Номер {chosen_number} уже занят\n\n"
-                f"Свободные числа:\n{hint}\n\n"
-                f"🎲 Или нажми «Случайный номер»",
-                reply_markup=choose_number_kb()
-            )
-        else:
-            await message.answer(
-                f"⚠️ Номер {chosen_number} уже занят\n"
-                f"✍️ Напиши другой номер\n"
-                f"🎲 Или нажми «Случайный номер»",
-                reply_markup=choose_number_kb()
-            )
-        return
+        username = message.from_user.username
+        full_name = message.from_user.full_name
+        display_name = f"@{username}" if username else full_name
 
-    username = message.from_user.username
-    full_name = message.from_user.full_name
-    display_name = f"@{username}" if username else full_name
-
-    ok = add_participant(user_id, display_name, chosen_number)
-    if not ok:
-        await message.answer(
-            "Этот номер только что заняли ❌\nВыбери другой.",
-            reply_markup=choose_number_kb()
-        )
-        return
+        ok = add_participant(user_id, display_name, chosen_number)
+        if not ok:
+            await message.answer(
+                "Этот номер только что заняли ❌\nВыбери другой.",
+                reply_markup=choose_number_kb(),
+            )
+            return
 
     pending_number_choice.discard(user_id)
     reset_wrong_code_attempts(user_id)
@@ -1825,18 +1849,13 @@ async def process_personal_number(message: types.Message, state: FSMContext):
         f"Твой номер: {chosen_number}"
     )
 
-    if current_giveaway.get("end_mode") == "count":
-        if get_participants_count() >= current_giveaway.get("end_value"):
-            await finish_giveaway("набрано нужное количество участников")
-            return
-
-    await update_status_message()
+    await maybe_finish_count_mode()
 
 
 # =========================
 # УЧАСТИЕ ПОЛЬЗОВАТЕЛЯ
 # =========================
-@dp.message_handler()
+@dp.message_handler(content_types=types.ContentTypes.TEXT)
 async def check_code(message: types.Message):
     if not current_giveaway.get("active"):
         await message.answer("Сейчас нет активного розыгрыша")
@@ -1860,7 +1879,7 @@ async def check_code(message: types.Message):
         return
 
     text = (message.text or "").strip()
-    current_code = current_giveaway.get("code")
+    current_code = (current_giveaway.get("code") or "").strip()
 
     if text != current_code:
         register_wrong_code_attempt(user_id)

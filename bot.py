@@ -136,21 +136,29 @@ def format_remaining_time(target_dt: Optional[datetime]) -> str:
         return "меньше минуты"
 
     days = total_seconds // 86400
-    hours = (total_seconds % 86400) // 3600
-    minutes = (total_seconds % 3600) // 60
-    seconds = total_seconds % 60
+    remainder = total_seconds % 86400
+    hours = remainder // 3600
+    remainder = remainder % 3600
 
     parts = []
+
     if days > 0:
         parts.append(f"{days}д")
+
     if hours > 0:
         parts.append(f"{hours}ч")
-    if minutes > 0:
-        parts.append(f"{minutes}м")
-    if not parts and seconds > 0:
-        parts.append(f"{seconds}с")
+        minutes = remainder // 60
+        if minutes > 0:
+            parts.append(f"{minutes}м")
+        return " ".join(parts)
 
-    return " ".join(parts) if parts else "меньше минуты"
+    # Для коротких интервалов округляем минуты вверх,
+    # чтобы 1м 50с не показывалось как 1м.
+    if total_seconds >= 60:
+        minutes_up = (total_seconds + 59) // 60
+        return f"{minutes_up}м"
+
+    return f"{total_seconds}с"
 
 
 # =========================
@@ -626,7 +634,7 @@ def build_status_text() -> str:
             if seconds_left > 60:
                 return f"⏳ До конца розыгрыша: {format_remaining_time(end_dt)}"
 
-            # LAST MINUTE сценарий
+            # LAST MINUTE сценарий + секундный отсчёт в конце
             if seconds_left > 40:
                 return "⏳ Меньше минуты\n\n👀 Не моргай..."
             elif seconds_left > 25:
@@ -635,12 +643,8 @@ def build_status_text() -> str:
                 return "⏳ Финал близко\n\n🎯 Готовься"
             elif seconds_left > 10:
                 return "⏳ Последние секунды\n\n⚡ Прямо сейчас"
-            elif seconds_left > 5:
-                return "👀 Смотри внимательно..."
-            elif seconds_left > 3:
-                return "⚡ Уже выбираем..."
             else:
-                return "🎲 Выбираем..."
+                return f"⏳ До финала: {seconds_left}с\n\n🎲 Выбираем..."
 
         # ===== COUNT MODE =====
         total_needed = current_giveaway.get("end_value", 0) or 0
@@ -686,7 +690,30 @@ async def update_status_message():
     status_message_id = current_giveaway.get("status_message_id")
     if not status_message_id:
         return
+
     await safe_edit_message(CHANNEL_ID, status_message_id, build_status_text())
+
+    # Подстраиваем частоту обновления, чтобы в последнюю минуту
+    # был плавный отсчёт без риска flood control.
+    try:
+        if current_giveaway.get("active") and current_giveaway.get("end_mode") == "time":
+            end_dt = parse_dt(current_giveaway.get("end_datetime"))
+            if end_dt:
+                seconds_left = int((end_dt - now_utc3()).total_seconds())
+
+                desired_interval = 5
+                if 0 < seconds_left <= 10:
+                    desired_interval = 1
+                elif 0 < seconds_left <= 60:
+                    desired_interval = 2
+
+                job = scheduler.get_job(STATUS_JOB_ID)
+                if job:
+                    current_interval = int(job.trigger.interval.total_seconds())
+                    if current_interval != desired_interval:
+                        await start_status_updates()
+    except Exception:
+        pass
 
 
 async def start_status_updates():
@@ -695,10 +722,20 @@ async def start_status_updates():
     except Exception:
         pass
 
+    interval_seconds = 5
+    if current_giveaway.get("active") and current_giveaway.get("end_mode") == "time":
+        end_dt = parse_dt(current_giveaway.get("end_datetime"))
+        if end_dt:
+            seconds_left = int((end_dt - now_utc3()).total_seconds())
+            if 0 < seconds_left <= 10:
+                interval_seconds = 1
+            elif 0 < seconds_left <= 60:
+                interval_seconds = 2
+
     scheduler.add_job(
         update_status_message,
         trigger="interval",
-        seconds=5,
+        seconds=interval_seconds,
         id=STATUS_JOB_ID,
         replace_existing=True
     )

@@ -152,8 +152,6 @@ def format_remaining_time(target_dt: Optional[datetime]) -> str:
             parts.append(f"{minutes}м")
         return " ".join(parts)
 
-    # Для коротких интервалов округляем минуты вверх,
-    # чтобы 1м 50с не показывалось как 1м.
     if total_seconds >= 60:
         minutes_up = (total_seconds + 59) // 60
         return f"{minutes_up}м"
@@ -504,10 +502,14 @@ def cancel_kb() -> InlineKeyboardMarkup:
 
 def start_mode_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(InlineKeyboardButton("⚡ Сейчас", callback_data="start_now"))
     kb.add(
-        InlineKeyboardButton("⚡ Сейчас", callback_data="start_now"),
-        InlineKeyboardButton("🕒 По времени", callback_data="start_schedule"),
+        InlineKeyboardButton("⏱ +5 мин", callback_data="start_5"),
+        InlineKeyboardButton("⏱ +15 мин", callback_data="start_15"),
+        InlineKeyboardButton("⏱ +30 мин", callback_data="start_30"),
+        InlineKeyboardButton("⏱ +1 час", callback_data="start_60"),
     )
+    kb.add(InlineKeyboardButton("🕒 Выбрать время", callback_data="start_schedule"))
     kb.add(InlineKeyboardButton("❌ Отмена", callback_data="setup_cancel"))
     return kb
 
@@ -626,7 +628,6 @@ async def animate_winner_selection(participants: List[Tuple[int, str, str, Optio
 def build_status_text() -> str:
     if current_giveaway.get("active"):
 
-        # ===== TIME MODE =====
         if current_giveaway.get("end_mode") == "time":
             end_dt = parse_dt(current_giveaway.get("end_datetime"))
             if not end_dt:
@@ -640,7 +641,6 @@ def build_status_text() -> str:
             if seconds_left > 60:
                 return f"⏳ До конца розыгрыша: {format_remaining_time(end_dt)}"
 
-            # LAST MINUTE сценарий + секундный отсчёт в конце
             if seconds_left > 40:
                 return "⏳ Меньше минуты\n\n👀 Не моргай..."
             elif seconds_left > 25:
@@ -654,7 +654,6 @@ def build_status_text() -> str:
             else:
                 return "🎲 Выбираем..."
 
-        # ===== COUNT MODE =====
         total_needed = current_giveaway.get("end_value", 0) or 0
         current_count = get_participants_count()
         left = max(total_needed - current_count, 0)
@@ -671,7 +670,6 @@ def build_status_text() -> str:
         else:
             return f"👥 Осталось мест: {left}"
 
-    # BEFORE START
     if current_giveaway.get("start_mode") == "scheduled":
         start_dt = parse_dt(current_giveaway.get("start_datetime"))
         if not start_dt:
@@ -701,8 +699,6 @@ async def update_status_message():
 
     await safe_edit_message(CHANNEL_ID, status_message_id, build_status_text())
 
-    # Подстраиваем частоту обновления, чтобы в последнюю минуту
-    # был плавный отсчёт без риска flood control.
     try:
         if current_giveaway.get("active") and current_giveaway.get("end_mode") == "time":
             end_dt = parse_dt(current_giveaway.get("end_datetime"))
@@ -781,7 +777,6 @@ async def publish_active_status_under_post():
     await start_status_updates()
 
 
-# ===== FINAL ANIMATION =====
 async def animate_winners_in_channel(winner_rows):
     message_id = current_giveaway.get("status_message_id")
 
@@ -789,32 +784,27 @@ async def animate_winners_in_channel(winner_rows):
         await publish_status_message()
         message_id = current_giveaway.get("status_message_id")
 
-    # phase 1
     for _ in range(3):
         for dots in [".", "..", "..."]:
             await asyncio.sleep(0.25)
             await safe_edit_message(CHANNEL_ID, message_id, f"🎲 Выбираем{dots}")
 
-    # phase 2
     for _ in range(2):
         for dots in [".", "..", "..."]:
             await asyncio.sleep(0.25)
             await safe_edit_message(CHANNEL_ID, message_id, f"⚡ Идёт выбор{dots}")
 
-    # fake pause
     await asyncio.sleep(0.6)
     await safe_edit_message(CHANNEL_ID, message_id, "👀 Почти...")
     await asyncio.sleep(0.7)
     await safe_edit_message(CHANNEL_ID, message_id, "👀 Почти выбрали...")
     await asyncio.sleep(0.7)
 
-    # final hit
     await safe_edit_message(CHANNEL_ID, message_id, "🎯 Финальный выбор...")
     await asyncio.sleep(0.5)
     await safe_edit_message(CHANNEL_ID, message_id, "...")
     await asyncio.sleep(0.4)
 
-    # result
     if len(winner_rows) == 1:
         _, name, _, num = winner_rows[0]
         await safe_edit_message(
@@ -1227,8 +1217,6 @@ async def status_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return
 
-    max_number = get_current_number_max()
-
     if not current_giveaway.get("active"):
         if current_giveaway.get("start_mode") == "scheduled" and current_giveaway.get("start_datetime"):
             finish_text = (
@@ -1298,8 +1286,6 @@ async def cb_admin_active(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
 
-    max_number = get_current_number_max()
-
     if not current_giveaway.get("active"):
         if current_giveaway.get("start_mode") == "scheduled" and current_giveaway.get("start_datetime"):
             text = (
@@ -1365,8 +1351,6 @@ async def cb_finish_now(callback: types.CallbackQuery):
 async def cb_admin_status(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
-
-    max_number = get_current_number_max()
 
     if not current_giveaway.get("active"):
         if current_giveaway.get("start_mode") == "scheduled" and current_giveaway.get("start_datetime"):
@@ -1647,19 +1631,47 @@ async def process_description(message: types.Message, state: FSMContext):
     await message.answer("Когда запускать розыгрыш?", reply_markup=start_mode_kb())
 
 
-@dp.callback_query_handler(lambda c: c.data in ["start_now", "start_schedule"], state=GiveawayForm.waiting_start_mode)
+@dp.callback_query_handler(
+    lambda c: c.data in ["start_now", "start_schedule", "start_5", "start_15", "start_30", "start_60"],
+    state=GiveawayForm.waiting_start_mode
+)
 async def process_start_mode(callback: types.CallbackQuery, state: FSMContext):
+    now = now_utc3()
+
     if callback.data == "start_now":
         await state.update_data(start_mode="now", start_datetime=None)
         await GiveawayForm.waiting_end_mode.set()
         await callback.message.answer("Как завершать розыгрыш?", reply_markup=end_mode_kb())
-    else:
+
+    elif callback.data == "start_schedule":
         await state.update_data(start_mode="scheduled")
         await GiveawayForm.waiting_start_datetime.set()
         await send_step_hint_cb(
             callback,
             f"Введи дату и время старта в формате:\n01.01.2000 23:59\n\n{current_time_hint()}"
         )
+
+    else:
+        if callback.data == "start_5":
+            start_dt = now + timedelta(minutes=5)
+        elif callback.data == "start_15":
+            start_dt = now + timedelta(minutes=15)
+        elif callback.data == "start_30":
+            start_dt = now + timedelta(minutes=30)
+        else:
+            start_dt = now + timedelta(hours=1)
+
+        await state.update_data(
+            start_mode="scheduled",
+            start_datetime=start_dt.isoformat()
+        )
+        await GiveawayForm.waiting_end_mode.set()
+        await callback.message.answer(
+            f"✅ Старт установлен на {format_dt(start_dt)}\n{TIMEZONE_TEXT}\n\n"
+            "Как завершать розыгрыш?",
+            reply_markup=end_mode_kb()
+        )
+
     await callback.answer()
 
 

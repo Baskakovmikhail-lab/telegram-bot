@@ -706,9 +706,20 @@ async def publish_giveaway_post():
         raise RuntimeError("Не хватает медиа для публикации")
 
     if media_type == "video":
-        post = await bot.send_video(CHANNEL_ID, media_file_id, caption=description)
+        post = await bot.send_video(
+            CHANNEL_ID,
+            media_file_id,
+            caption=description,
+            supports_streaming=False,
+            protect_content=True,
+        )
     else:
-        post = await bot.send_photo(CHANNEL_ID, media_file_id, caption=description)
+        post = await bot.send_photo(
+            CHANNEL_ID,
+            media_file_id,
+            caption=description,
+            protect_content=True,
+        )
 
     current_giveaway["post_message_id"] = post.message_id
     save_giveaway(current_giveaway)
@@ -1094,21 +1105,27 @@ async def cancel_setup_cmd(message: types.Message, state: FSMContext):
         return
 
     await state.finish()
+    await remove_start_job()
+    await remove_finish_job()
+    await stop_status_updates()
+    clear_giveaway_db()
+    reset_runtime_state()
     await message.answer("Создание розыгрыша отменено ❌", reply_markup=admin_menu_kb())
 
 
-@dp.message_handler(commands=["cancel"])
-async def cancel_cmd(message: types.Message):
+@dp.message_handler(commands=["cancel"], state="*")
+async def cancel_cmd(message: types.Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
 
+    await state.finish()
     await cancel_current_giveaway("Розыгрыш отменён ❌")
 
 
 # =========================
 # USER COMMANDS
 # =========================
-@dp.message_handler(commands=["start"])
+@dp.message_handler(commands=["start"], state="*")
 async def start_cmd(message: types.Message):
     if not current_giveaway.get("active"):
         await message.answer(
@@ -1143,7 +1160,7 @@ async def start_cmd(message: types.Message):
     )
 
 
-@dp.message_handler(commands=["ikota"])
+@dp.message_handler(commands=["ikota"], state="*")
 async def ikota_cmd(message: types.Message):
     if is_admin(message.from_user.id):
         await message.answer(
@@ -1164,7 +1181,7 @@ async def ikota_cmd(message: types.Message):
         )
 
 
-@dp.message_handler(commands=["status"])
+@dp.message_handler(commands=["status"], state="*")
 async def status_cmd(message: types.Message):
     if not is_admin(message.from_user.id):
         return
@@ -1339,6 +1356,11 @@ async def cb_setup_cancel(callback: types.CallbackQuery, state: FSMContext):
         return
 
     await state.finish()
+    await remove_start_job()
+    await remove_finish_job()
+    await stop_status_updates()
+    clear_giveaway_db()
+    reset_runtime_state()
     await callback.message.answer("Создание розыгрыша отменено ❌", reply_markup=admin_menu_kb())
     await callback.answer()
 
@@ -1352,6 +1374,10 @@ async def cb_publish_now(callback: types.CallbackQuery):
 
     if not current_giveaway:
         await callback.answer("Нет данных для публикации", show_alert=True)
+        return
+
+    if not current_giveaway.get("media_type") or not current_giveaway.get("media_file_id") or not current_giveaway.get("code"):
+        await callback.answer("Черновик уже неактуален", show_alert=True)
         return
 
     if current_giveaway.get("start_mode") == "now":
@@ -1407,6 +1433,10 @@ async def cb_publish_now(callback: types.CallbackQuery):
 async def cb_publish_cancel(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         return
+
+    await remove_start_job()
+    await remove_finish_job()
+    await stop_status_updates()
 
     if current_giveaway.get("status_message_id"):
         await safe_delete_message(CHANNEL_ID, current_giveaway.get("status_message_id"))
@@ -1685,9 +1715,20 @@ async def process_code(message: types.Message, state: FSMContext):
 
     caption = build_caption(current_giveaway["description"])
     if current_giveaway["media_type"] == "video":
-        await bot.send_video(ADMIN_ID, current_giveaway["media_file_id"], caption=caption)
+        await bot.send_video(
+            ADMIN_ID,
+            current_giveaway["media_file_id"],
+            caption=caption,
+            supports_streaming=False,
+            protect_content=True,
+        )
     else:
-        await bot.send_photo(ADMIN_ID, current_giveaway["media_file_id"], caption=caption)
+        await bot.send_photo(
+            ADMIN_ID,
+            current_giveaway["media_file_id"],
+            caption=caption,
+            protect_content=True,
+        )
 
     await message.answer(
         "👇 Так будет выглядеть пост\n\nЕсли всё ок — нажми «Опубликовать».",
